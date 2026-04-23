@@ -69,17 +69,15 @@ def perform_transform(
     # Load transform function
     transform_func = _load_transform_function(transform_file)
 
-    # Apply transformations
+    # Apply transformations — V3 transform files use apply_transforms(df) signature
     try:
         if rulebook is not None:
             df_transformed = transform_func(df, rulebook)
         else:
-            # Try calling with just df
             try:
-                df_transformed = transform_func(df,target_mode)
+                df_transformed = transform_func(df)
             except TypeError:
-                # Function requires rulebook, pass empty dict
-                df_transformed = transform_func(df, {})
+                df_transformed = transform_func(df, target_mode)
     except Exception as exc:
         logger.error("Transform function failed: %s", exc)
         raise

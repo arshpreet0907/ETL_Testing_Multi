@@ -2,14 +2,19 @@
 utils/auto_config.py
 --------------------
 Databricks version — auto-configuration from excel_files/etl_output/ folder.
-Flattened path (no dummy/ subfolder). Snowflake target only.
+V3 multi-server layout: detects server subdirectories containing 04_transform.py.
+
+Returns a config dict with a 'servers' list — one entry per server.
 """
 
 import os
 import re
-import yaml
-from typing import Dict, List, Optional
+from typing import Dict, List
 
+
+# ============================================================================
+# PUBLIC API
+# ============================================================================
 
 def get_table_config(
     table_name: str,
@@ -17,16 +22,36 @@ def get_table_config(
     target_mode: str = "snowflake",
 ) -> Dict:
     """
-    Auto-configure pipeline settings based on table name.
+    Auto-configure pipeline settings for a V3 multi-server table.
 
     Parameters
     ----------
     table_name : str
-        Table folder name (e.g., "cost_ledger", "employee_master")
+        Table folder name (e.g., "public_dim_vehicle_master")
     base_path : str, optional
         Base path to etl_output folder. Auto-detects from project root if None.
     target_mode : str
         Only "snowflake" supported on Databricks.
+
+    Returns
+    -------
+    dict
+        {
+            "table_name": str,
+            "target_ddl": str,
+            "target_query_file": str,
+            "target_database": str,
+            "target_table": str,
+            "primary_keys": list[str],
+            "exclude_cols": list[str],
+            "servers": [
+                {
+                    "server_name": str,
+                    "transform_file": str,
+                },
+                ...
+            ],
+        }
     """
     if base_path is None:
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -40,53 +65,56 @@ def get_table_config(
             f"Available tables: {', '.join(_list_available_tables(base_path))}"
         )
 
-    # Build file paths
-    source_ddl = os.path.join(table_folder, "01_create_source_table.sql")
-    source_query_file = os.path.join(table_folder, "03_extract_source.sql")
-    transform_file = os.path.join(table_folder, "04_transform.py")
+    # Detect server subdirectories
+    server_dirs = _detect_server_dirs(table_folder)
+    if not server_dirs:
+        raise ValueError(
+            f"No V3 server directories found in: {table_folder}\n"
+            f"Expected subdirectories containing 03_extract_source.sql"
+        )
 
-    # Snowflake target files only
+    # Shared target files
     target_ddl = os.path.join(table_folder, "02_create_target_sf.sql")
     target_query_file = os.path.join(table_folder, "05_extract_target_sf.sql")
 
-    # Validate required files exist
     for label, path in [
-        ("Source DDL", source_ddl),
         ("Target DDL", target_ddl),
-        ("Source query", source_query_file),
-        ("Transform", transform_file),
         ("Target query", target_query_file),
     ]:
         if not os.path.isfile(path):
             raise FileNotFoundError(f"{label} file not found: {path}")
 
-    # Extract database and table names from DDL
-    source_db, source_tbl = _parse_ddl_table_name(source_ddl)
+    # Parse PKs from target DDL
+    primary_keys = _parse_primary_keys_from_target_ddl(target_ddl)
+
+    # Parse target table name from DDL
     target_db, target_tbl = _parse_ddl_table_name(target_ddl)
 
-    # Extract primary keys
-    source_primary_keys = _parse_primary_keys(source_ddl)
-    target_primary_keys = _parse_primary_keys(target_ddl)
+    # Build per-server configs
+    servers = []
+    for server_name in server_dirs:
+        server_path = os.path.join(table_folder, server_name)
+        transform_file = os.path.join(server_path, "04_transform.py")
 
-    exclude_cols = ["load_ts"]
-    output_dir = os.path.join("output", table_name)
+        if not os.path.isfile(transform_file):
+            raise FileNotFoundError(
+                f"Transform file not found for server '{server_name}': {transform_file}"
+            )
+
+        servers.append({
+            "server_name": server_name,
+            "transform_file": transform_file,
+        })
 
     return {
         "table_name": table_name,
-        "source_ddl": source_ddl,
         "target_ddl": target_ddl,
-        "source_query_file": source_query_file,
         "target_query_file": target_query_file,
-        "transform_file": transform_file,
-        "source_database": source_db,
-        "source_table": source_tbl,
         "target_database": target_db,
         "target_table": target_tbl,
-        "source_primary_keys": source_primary_keys,
-        "target_primary_keys": target_primary_keys,
-        "primary_keys": target_primary_keys,
-        "exclude_cols": exclude_cols,
-        "output_dir": output_dir,
+        "primary_keys": primary_keys,
+        "exclude_cols": ["load_ts", "batch_id"],
+        "servers": servers,
     }
 
 
@@ -97,62 +125,87 @@ def list_available_tables(target_mode: str = "snowflake") -> List[str]:
     return _list_available_tables(base_path)
 
 
-def _list_available_tables(base_path: str) -> List[str]:
-    if not os.path.isdir(base_path):
-        return []
-    return [
-        d for d in sorted(os.listdir(base_path))
-        if os.path.isdir(os.path.join(base_path, d)) and not d.startswith(".")
-    ]
+# ============================================================================
+# V3 DETECTION
+# ============================================================================
+
+def _detect_server_dirs(table_folder: str) -> List[str]:
+    """
+    Find subdirectories that contain 03_extract_source.sql (V3 server folders).
+    Returns list of server directory names, or empty list if none found.
+    """
+    servers = []
+    for entry in sorted(os.listdir(table_folder)):
+        entry_path = os.path.join(table_folder, entry)
+        if not os.path.isdir(entry_path):
+            continue
+        extract_sql = os.path.join(entry_path, "03_extract_source.sql")
+        if os.path.isfile(extract_sql):
+            servers.append(entry)
+    return servers
 
 
-def _parse_ddl_table_name(ddl_file: str) -> tuple:
-    with open(ddl_file, "r", encoding="utf-8") as fh:
-        content = fh.read()
+# ============================================================================
+# DDL PARSERS
+# ============================================================================
 
-    match = re.search(
-        r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)",
-        content, re.IGNORECASE,
-    )
-    if match:
-        return match.group(1), match.group(2)
-
-    match = re.search(
-        r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([a-zA-Z0-9_]+)",
-        content, re.IGNORECASE,
-    )
-    if match:
-        table_name = match.group(1)
-        db_match = re.search(r"--\s*(?:Source|Target)\s+table\s*:\s*([a-zA-Z0-9_]+)", content)
-        if db_match:
-            return None, db_match.group(1)
-        return None, table_name
-
-    raise ValueError(f"Could not parse table name from DDL file: {ddl_file}")
-
-
-def _parse_primary_keys(ddl_file: str) -> List[str]:
+def _parse_primary_keys_from_target_ddl(ddl_file: str) -> List[str]:
+    """Extract primary key column names from a Snowflake target DDL file."""
     with open(ddl_file, "r", encoding="utf-8") as fh:
         content = fh.read()
 
     match = re.search(r"PRIMARY\s+KEY\s*\(([^)]+)\)", content, re.IGNORECASE)
     if match:
-        return [col.strip().strip('`"') for col in match.group(1).split(",")]
+        pk_str = match.group(1)
+        return [col.strip().strip('`"').upper() for col in pk_str.split(",")]
 
+    # Fallback: look for -- PK comments
     pks = []
     for line in content.split("\n"):
         if "-- PK" in line or "--PK" in line:
-            m = re.match(r"\s*([a-zA-Z0-9_]+)\s+", line)
+            m = re.match(r"\s*([A-Za-z0-9_]+)\s+", line)
             if m:
-                pks.append(m.group(1))
-    if pks:
-        return pks
+                pks.append(m.group(1).upper())
+    return pks
 
-    raise ValueError(f"Could not parse primary keys from DDL file: {ddl_file}")
 
+def _parse_ddl_table_name(ddl_file: str) -> tuple:
+    """Extract database and table name from DDL file."""
+    with open(ddl_file, "r", encoding="utf-8") as fh:
+        content = fh.read()
+
+    # db.schema.table
+    match = re.search(
+        r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)\.(\w+)\.(\w+)",
+        content, re.IGNORECASE,
+    )
+    if match:
+        return match.group(1), match.group(3)
+
+    # db.table
+    match = re.search(
+        r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)\.(\w+)",
+        content, re.IGNORECASE,
+    )
+    if match:
+        return match.group(1), match.group(2)
+
+    # just table
+    match = re.search(
+        r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)",
+        content, re.IGNORECASE,
+    )
+    if match:
+        return None, match.group(1)
+
+    raise ValueError(f"Could not parse table name from DDL file: {ddl_file}")
+
+
+# ============================================================================
+# FILTER BUILDER
+# ============================================================================
 
 def build_filter_for_query(
-    query_type: str,
     config: dict,
     pk_filter_mode: str,
     pk_range: dict,
@@ -163,17 +216,15 @@ def build_filter_for_query(
     date_to: str,
     date_to_col: str,
 ) -> dict:
-    """Build WHERE clause filter using correct PK column for source or target query."""
+    """Build WHERE clause filter using PKs from target DDL."""
     from utils.query_filter import build_where_clause, get_columns_from_ddl
 
-    if query_type == "source":
-        pk_col = config["source_primary_keys"][0] if config.get("source_primary_keys") else None
-        ddl_file = config["source_ddl"]
-    else:
-        pk_col = config["target_primary_keys"][0] if config.get("target_primary_keys") else None
-        ddl_file = config["target_ddl"]
+    pk_col = config["primary_keys"][0] if config.get("primary_keys") else None
 
-    available_cols = get_columns_from_ddl(ddl_file) if ddl_file else []
+    available_cols = []
+    ddl_file = config.get("target_ddl")
+    if ddl_file:
+        available_cols = get_columns_from_ddl(ddl_file)
 
     where_clause = build_where_clause(
         pk_filter_mode=pk_filter_mode,
@@ -202,3 +253,15 @@ def build_filter_for_query(
         "description": description,
     }
 
+
+# ============================================================================
+# HELPERS
+# ============================================================================
+
+def _list_available_tables(base_path: str) -> List[str]:
+    if not os.path.isdir(base_path):
+        return []
+    return [
+        d for d in sorted(os.listdir(base_path))
+        if os.path.isdir(os.path.join(base_path, d)) and not d.startswith(".")
+    ]
