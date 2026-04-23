@@ -1002,10 +1002,13 @@ def _normalise_df(df: DataFrame, cols: List[str], precision_map: dict = None) ->
                 # Float / double / decimal with auto-detected precision →
                 # round to *scale* decimal places before string cast.
                 # This eliminates IEEE-754 noise like 128129.02000000002.
+                # Use format_string to preserve trailing zeros (e.g. "10986.00"
+                # not "10986.0") so source CSV strings match target numerics.
+                fmt = f"%.{scale}f"
                 norm_exprs.append(
                     F.when(F.col(col).isNull(), F.lit(None).cast(StringType()))
                     .otherwise(
-                        F.round(F.col(col).cast("double"), scale).cast(StringType())
+                        F.format_string(fmt, F.round(F.col(col).cast("double"), scale))
                     )
                     .alias(col)
                 )
