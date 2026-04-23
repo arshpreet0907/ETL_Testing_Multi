@@ -29,7 +29,6 @@ dbutils.widgets.text("TABLE_NAME", "public_dim_vehicle_master")
 dbutils.widgets.text("SUB_PATH", "xl")
 dbutils.widgets.text("STORAGE_ACCOUNT", "etlstorage0907")
 dbutils.widgets.text("CONTAINER", "etl-source-data")
-dbutils.widgets.text("VERIFY_SCHEMA", "true")
 dbutils.widgets.text("PK_FILTER_MODE", "full")
 dbutils.widgets.text("DATE_WATERMARK_MODE", "full")
 dbutils.widgets.text("PK_RANGE_LOWER", "")
@@ -40,14 +39,13 @@ dbutils.widgets.text("DATE_TO", "")
 dbutils.widgets.text("DATE_TO_COL", "")
 
 # ── Snowflake database override (widget vs secrets toggle) ─────
-dbutils.widgets.text("SF_DATABASE", "ETL_OUTPUT_SNOWFLAKE_TARGET_JOINS")
+dbutils.widgets.text("SF_DATABASE", "ANALYTICS_DW")
 SF_DATABASE = dbutils.widgets.get("SF_DATABASE") or None
 
 TABLE_NAME = dbutils.widgets.get("TABLE_NAME")
 SUB_PATH = dbutils.widgets.get("SUB_PATH")
 STORAGE_ACCOUNT = dbutils.widgets.get("STORAGE_ACCOUNT")
 CONTAINER = dbutils.widgets.get("CONTAINER")
-VERIFY_SCHEMA = dbutils.widgets.get("VERIFY_SCHEMA").lower() == "true"
 PK_FILTER_MODE = dbutils.widgets.get("PK_FILTER_MODE")
 DATE_WATERMARK_MODE = dbutils.widgets.get("DATE_WATERMARK_MODE")
 
@@ -164,7 +162,6 @@ _log.info(f"   Target filter: {TARGET_FILTER['description']}")
 pipeline_ctx = dict(
     config=config,
     target_mode="snowflake",
-    verify_schema=VERIFY_SCHEMA,
     target_query=None,
     target_query_file=config["target_query_file"],
     primary_keys=config["primary_keys"],
