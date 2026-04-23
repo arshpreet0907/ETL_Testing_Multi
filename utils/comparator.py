@@ -992,12 +992,22 @@ def _normalise_df(df: DataFrame, cols: List[str], precision_map: dict = None) ->
                     .alias(col)
                 )
             else:
-                # Integer type or no precision entry → cast without rounding
-                norm_exprs.append(
-                    F.when(F.col(col).isNull(), F.lit(None).cast(StringType()))
-                    .otherwise(F.col(col).cast("double").cast(StringType()))
-                    .alias(col)
-                )
+                if col in integer_cols:
+                    # Integer type → cast to long then string (avoids ".0" suffix
+                    # that double→string produces, which breaks PK joins when
+                    # the other side has the same column as StringType).
+                    norm_exprs.append(
+                        F.when(F.col(col).isNull(), F.lit(None).cast(StringType()))
+                        .otherwise(F.col(col).cast("long").cast(StringType()))
+                        .alias(col)
+                    )
+                else:
+                    # Float/double without precision entry → cast via double
+                    norm_exprs.append(
+                        F.when(F.col(col).isNull(), F.lit(None).cast(StringType()))
+                        .otherwise(F.col(col).cast("double").cast(StringType()))
+                        .alias(col)
+                    )
         else:
             norm_exprs.append(
                 F.when(F.col(col).isNull(), F.lit(None).cast(StringType()))
