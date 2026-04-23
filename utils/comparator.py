@@ -951,7 +951,11 @@ def _normalise_df(df: DataFrame, cols: List[str], precision_map: dict = None) ->
     # Identify numeric columns by schema type
     numeric_types = (IntegerType, LongType, FloatType, DoubleType,
                      DecimalType, ShortType, ByteType)
-    # Separate integer-family (no decimals) from fractional numeric types
+    # Separate integer-family (no decimals) from fractional numeric types.
+    # Includes DecimalType with scale=0 (e.g. Snowflake NUMBER(38,0))
+    # which is effectively an integer and must NOT go through double→string
+    # (that produces "1000024.0" instead of "1000024", breaking PK joins
+    # when the other side has the column as StringType from CSV).
     integer_types = (IntegerType, LongType, ShortType, ByteType)
 
     numeric_cols = [
@@ -962,11 +966,16 @@ def _normalise_df(df: DataFrame, cols: List[str], precision_map: dict = None) ->
     integer_cols = {
         field.name
         for field in df.schema.fields
-        if field.name in cols and isinstance(field.dataType, integer_types)
+        if field.name in cols and (
+            isinstance(field.dataType, integer_types)
+            or (isinstance(field.dataType, DecimalType) and field.dataType.scale == 0)
+        )
     }
 
     logger.info("Detected %d numeric columns for normalization: %s",
                 len(numeric_cols), numeric_cols)
+    logger.info("Detected %d integer-like columns (inc. Decimal scale=0): %s",
+                len(integer_cols), sorted(integer_cols))
     if precision_map:
         applicable = {c: s for c, s in precision_map.items() if c in numeric_cols}
         if applicable:
@@ -980,7 +989,16 @@ def _normalise_df(df: DataFrame, cols: List[str], precision_map: dict = None) ->
     for col in cols:
         if col in numeric_cols:
             scale = precision_map.get(col)
-            if scale is not None and col not in integer_cols:
+            if col in integer_cols:
+                # Integer type or DecimalType(x, 0) → cast to long then string.
+                # Avoids ".0" suffix that double→string produces, which breaks
+                # PK joins when the other side has the column as StringType.
+                norm_exprs.append(
+                    F.when(F.col(col).isNull(), F.lit(None).cast(StringType()))
+                    .otherwise(F.col(col).cast("long").cast(StringType()))
+                    .alias(col)
+                )
+            elif scale is not None:
                 # Float / double / decimal with auto-detected precision →
                 # round to *scale* decimal places before string cast.
                 # This eliminates IEEE-754 noise like 128129.02000000002.
@@ -992,22 +1010,12 @@ def _normalise_df(df: DataFrame, cols: List[str], precision_map: dict = None) ->
                     .alias(col)
                 )
             else:
-                if col in integer_cols:
-                    # Integer type → cast to long then string (avoids ".0" suffix
-                    # that double→string produces, which breaks PK joins when
-                    # the other side has the same column as StringType).
-                    norm_exprs.append(
-                        F.when(F.col(col).isNull(), F.lit(None).cast(StringType()))
-                        .otherwise(F.col(col).cast("long").cast(StringType()))
-                        .alias(col)
-                    )
-                else:
-                    # Float/double without precision entry → cast via double
-                    norm_exprs.append(
-                        F.when(F.col(col).isNull(), F.lit(None).cast(StringType()))
-                        .otherwise(F.col(col).cast("double").cast(StringType()))
-                        .alias(col)
-                    )
+                # Float/double without precision entry → cast via double
+                norm_exprs.append(
+                    F.when(F.col(col).isNull(), F.lit(None).cast(StringType()))
+                    .otherwise(F.col(col).cast("double").cast(StringType()))
+                    .alias(col)
+                )
         else:
             norm_exprs.append(
                 F.when(F.col(col).isNull(), F.lit(None).cast(StringType()))
