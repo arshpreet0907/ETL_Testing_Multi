@@ -1,7 +1,7 @@
 -- ============================================================
 -- Partial source DDL: etl_output_mysql_xl.logistics_shipments
 -- Only columns referenced in mapping spec
--- Generated: 2026-04-24 01:13
+-- Generated: 2026-04-24 11:31
 -- ============================================================
 
 CREATE TABLE IF NOT EXISTS etl_output_mysql_xl.logistics_shipments (

@@ -1,6 +1,6 @@
 """
 04_transform.py  —  server1 -> analytics_dw.public.fact_commercial
-Generated: 2026-04-24 01:13
+Generated: 2026-04-24 11:31
 Approach: V3 (Combined Aliased Extract)
 
 Input DataFrame columns are already aliased to target names by the

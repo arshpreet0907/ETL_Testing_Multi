@@ -1,7 +1,7 @@
 -- ============================================================
 -- Target table: analytics_dw.public.fact_production
 -- Dialect: Snowflake
--- Generated: 2026-04-24 01:13
+-- Generated: 2026-04-24 11:31
 -- ============================================================
 
 CREATE TABLE IF NOT EXISTS analytics_dw.public.fact_production (

@@ -1,7 +1,7 @@
 -- ============================================================
 -- EXTRACT SOURCE | server: server1
 -- Target: analytics_dw.public.fact_production
--- Generated: 2026-04-24 01:13
+-- Generated: 2026-04-24 11:31
 -- ============================================================
 -- Main table: etl_output_mysql_xl.production_orders AS cte_main
 -- ROW_NUMBER JOIN etl_output_mysql_xl.quality_inspections AS cte_quality_inspections
@@ -17,25 +17,25 @@ WITH
 cte_main AS (
     SELECT
         prod_order_id, vehicle_id, plant_cd, order_dt, qty_produced, qty_rejected, order_status_cd, efficiency_pct, qty_planned,
-        ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS rn
+        ROW_NUMBER() OVER (ORDER BY prod_order_id) AS rn
     FROM etl_output_mysql_xl.production_orders
 ),
 cte_quality_inspections AS (
     SELECT
         inspection_id, inspection_dt, result_cd, inspection_score, rework_required_flag, rework_cost_amt,
-        ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS rn
+        ROW_NUMBER() OVER (ORDER BY inspection_id) AS rn
     FROM etl_output_mysql_xl.quality_inspections
 ),
 cte_paint_shop_log AS (
     SELECT
         paint_log_id, color_cd, oven_temp_celsius, defect_flag, paint_cost_amt,
-        ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS rn
+        ROW_NUMBER() OVER (ORDER BY paint_log_id) AS rn
     FROM etl_output_mysql_xl.paint_shop_log
 ),
 cte_engine_assembly_log AS (
     SELECT
         assembly_log_id, engine_type_cd, torque_nm, test_result_cd, assembly_cost_amt, defect_flag,
-        ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS rn
+        ROW_NUMBER() OVER (ORDER BY assembly_log_id) AS rn
     FROM etl_output_mysql_xl.engine_assembly_log
 )
 SELECT

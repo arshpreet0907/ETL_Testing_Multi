@@ -1,7 +1,7 @@
 -- ============================================================
 -- EXTRACT SOURCE | server: server1
 -- Target: analytics_dw.public.fact_commercial
--- Generated: 2026-04-24 01:13
+-- Generated: 2026-04-24 11:31
 -- ============================================================
 -- Main table: etl_output_mysql_xl.sales_orders AS cte_main
 -- ROW_NUMBER JOIN etl_output_mysql_xl.warranty_claims AS cte_warranty_claims
@@ -17,25 +17,25 @@ WITH
 cte_main AS (
     SELECT
         sales_order_id, vehicle_id, customer_id, order_dt, sale_price_amt, discount_pct, total_invoice_amt, payment_mode_cd, order_status_cd, region_cd,
-        ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS rn
+        ROW_NUMBER() OVER (ORDER BY sales_order_id) AS rn
     FROM etl_output_mysql_xl.sales_orders
 ),
 cte_warranty_claims AS (
     SELECT
         claim_id, claim_dt, defect_type_cd, repair_cost_amt, claim_status_cd, supplier_liability_flag,
-        ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS rn
+        ROW_NUMBER() OVER (ORDER BY claim_id) AS rn
     FROM etl_output_mysql_xl.warranty_claims
 ),
 cte_logistics_shipments AS (
     SELECT
         shipment_id, carrier_nm, shipment_dt, freight_cost_amt, status_cd, estimated_arrival_dt, actual_arrival_dt,
-        ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS rn
+        ROW_NUMBER() OVER (ORDER BY shipment_id) AS rn
     FROM etl_output_mysql_xl.logistics_shipments
 ),
 cte_cost_ledger AS (
     SELECT
         ledger_id, cost_type_cd, posting_dt, amount_lc, amount_usd, approved_flag,
-        ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS rn
+        ROW_NUMBER() OVER (ORDER BY ledger_id) AS rn
     FROM etl_output_mysql_xl.cost_ledger
 )
 SELECT

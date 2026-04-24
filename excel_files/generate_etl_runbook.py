@@ -394,6 +394,15 @@ def _src_key(src_table: str, src_col_name: str) -> tuple[str, str]:
     return (src_table or "").strip().lower(), (src_col_name or "").strip().lower()
 
 
+def _get_pk_col(cms: list[ColumnMapping]) -> str:
+    """Return the source PK column name for ROW_NUMBER ORDER BY.
+    Falls back to '(SELECT NULL)' if no PK is declared in the mapping spec."""
+    for cm in cms:
+        if cm.src_is_pk and cm.src_is_pk.strip().upper() in ("Y", "YES"):
+            return cm.src_col_name
+    return "(SELECT NULL)"
+
+
 def _null_cast_type(cm: ColumnMapping) -> str:
     """Prefer target dtype for SQL NULL placeholders, then source dtype."""
     return (cm.tgt_dtype or cm.src_dtype or "VARCHAR(255)").strip()
@@ -697,11 +706,12 @@ def build_extract_sql_v3(server: ServerData, parsed: ParsedExcel) -> str:
         for ecol in extra_src_cols_needed.get(main_old_alias, set()):
             if ecol not in main_cols_in_select:
                 main_cols_in_select.append(ecol)
+        main_pk = _get_pk_col(server.source_tables.get(server.main_table, []))
         cte_parts.append(
             f"cte_main AS (\n"
             f"    SELECT\n"
             f"        {', '.join(main_cols_in_select)},\n"
-            f"        ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS rn\n"
+            f"        ROW_NUMBER() OVER (ORDER BY {main_pk}) AS rn\n"
             f"    FROM {main_fqn}\n"
             f")"
         )
@@ -731,11 +741,12 @@ def build_extract_sql_v3(server: ServerData, parsed: ParsedExcel) -> str:
             for ecol in extra_src_cols_needed.get(et_old_alias, set()):
                 if ecol not in et_cols:
                     et_cols.append(ecol)
+            et_pk = _get_pk_col(server.source_tables.get(et, []))
             cte_parts.append(
                 f"cte_{et} AS (\n"
                 f"    SELECT\n"
                 f"        {', '.join(et_cols)},\n"
-                f"        ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS rn\n"
+                f"        ROW_NUMBER() OVER (ORDER BY {et_pk}) AS rn\n"
                 f"    FROM {et_fqn}\n"
                 f")"
             )

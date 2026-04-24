@@ -1,7 +1,7 @@
 -- ============================================================
 -- EXTRACT SOURCE | server: server1
 -- Target: analytics_dw.public.dim_vehicle_master
--- Generated: 2026-04-24 01:13
+-- Generated: 2026-04-24 11:31
 -- ============================================================
 -- Main table: etl_output_mysql_xl.vehicle_master AS cte_main
 -- ROW_NUMBER JOIN etl_output_mysql_xl.parts_inventory AS cte_parts_inventory
@@ -17,25 +17,25 @@ WITH
 cte_main AS (
     SELECT
         vehicle_id, vin_number, model_nm, variant_cd, model_yr, engine_type_cd, plant_cd, base_price_amt, status_cd, launch_dt, is_electric_flag,
-        ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS rn
+        ROW_NUMBER() OVER (ORDER BY vehicle_id) AS rn
     FROM etl_output_mysql_xl.vehicle_master
 ),
 cte_parts_inventory AS (
     SELECT
         part_id, part_no, part_category, unit_cost_amt, qty_on_hand, is_critical_flag,
-        ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS rn
+        ROW_NUMBER() OVER (ORDER BY part_id) AS rn
     FROM etl_output_mysql_xl.parts_inventory
 ),
 cte_supplier_master AS (
     SELECT
         supplier_id, supplier_nm, country_cd, rating_score, is_approved_flag,
-        ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS rn
+        ROW_NUMBER() OVER (ORDER BY supplier_id) AS rn
     FROM etl_output_mysql_xl.supplier_master
 ),
 cte_employee_master AS (
     SELECT
         emp_id, first_nm, dept_nm, role_nm, last_nm,
-        ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS rn
+        ROW_NUMBER() OVER (ORDER BY emp_id) AS rn
     FROM etl_output_mysql_xl.employee_master
 )
 SELECT
