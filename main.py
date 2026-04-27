@@ -7,7 +7,7 @@
 # MAGIC - **Target**: Snowflake via native Spark-Snowflake connector
 # MAGIC - **Output**: `diff_report.csv` written back to Azure Blob Storage
 # MAGIC - **Secrets**: Azure Key Vault via Databricks secret scope `etl-secrets`
-# MAGIC - **Flow**: Load per-server → Transform → Union → Verify Target → Compare
+# MAGIC - **Flow**: Generate Runbook → Load per-server → Transform → Union → Verify Target → Compare
 
 # COMMAND ----------
 
@@ -39,6 +39,17 @@ dbutils.widgets.text("DATE_FROM_COL", "")
 dbutils.widgets.text("DATE_TO", "")
 dbutils.widgets.text("DATE_TO_COL", "")
 
+# ── Partial column mode ─────────────────────────────────────────
+# Comma-separated target column names for partial extraction.
+# Leave empty for full table extraction.
+dbutils.widgets.text("PARTIAL_COLS", "")
+
+# ── Syntax check flag ──────────────────────────────────────────
+dbutils.widgets.text("RUN_SYNTAX_CHECK", "true")
+
+# ── Excel file name (for runbook generator) ────────────────────
+dbutils.widgets.text("EXCEL_FILE", "analytics_dw.public.dim_vehicle_master.xlsx")
+
 # ── Snowflake database override (widget vs secrets toggle) ─────
 dbutils.widgets.text("SF_DATABASE", "ANALYTICS_DW")
 SF_DATABASE = dbutils.widgets.get("SF_DATABASE") or None
@@ -50,6 +61,12 @@ CONTAINER = dbutils.widgets.get("CONTAINER")
 VERIFY_SCHEMA = dbutils.widgets.get("VERIFY_SCHEMA").lower() == "true"
 PK_FILTER_MODE = dbutils.widgets.get("PK_FILTER_MODE")
 DATE_WATERMARK_MODE = dbutils.widgets.get("DATE_WATERMARK_MODE")
+
+EXCEL_FILE = dbutils.widgets.get("EXCEL_FILE")
+RUN_SYNTAX_CHECK = dbutils.widgets.get("RUN_SYNTAX_CHECK").lower() == "true"
+
+_partial_raw = dbutils.widgets.get("PARTIAL_COLS").strip()
+PARTIAL_COLS = [c.strip().upper() for c in _partial_raw.split(",") if c.strip()] or None
 
 # PK range (optional)
 _pk_lower = dbutils.widgets.get("PK_RANGE_LOWER")
@@ -73,6 +90,9 @@ _log.info(f"Sub-path     : {SUB_PATH}")
 _log.info(f"Storage      : {STORAGE_ACCOUNT}/{CONTAINER}")
 _log.info(f"PK filter    : {PK_FILTER_MODE}")
 _log.info(f"Date filter  : {DATE_WATERMARK_MODE}")
+_log.info(f"Partial cols : {PARTIAL_COLS}")
+_log.info(f"Syntax check : {RUN_SYNTAX_CHECK}")
+_log.info(f"Excel file   : {EXCEL_FILE}")
 
 # COMMAND ----------
 
@@ -130,7 +150,31 @@ _log.info("✅ Spark config set")
 # COMMAND ----------
 
 # ═══════════════════════════════════════════════════════════════
-# CELL 5: BUILD PIPELINE CONTEXT
+# CELL 5: GENERATE RUNBOOK ARTIFACTS
+# ═══════════════════════════════════════════════════════════════
+
+from excel_files.generate_etl_runbook import generate_runbook
+
+_t0 = _time.time()
+excel_path = os.path.join(REPO_PATH, "excel_files", EXCEL_FILE)
+output_dir = os.path.join(REPO_PATH, "excel_files", "etl_output")
+
+_log.info(f"Generating runbook from: {EXCEL_FILE}")
+_log.info(f"  Partial cols  : {PARTIAL_COLS}")
+_log.info(f"  Syntax check  : {RUN_SYNTAX_CHECK}")
+
+generate_runbook(
+    excel_path,
+    output_dir,
+    partial_cols=PARTIAL_COLS,
+    run_syntax_check=RUN_SYNTAX_CHECK,
+)
+_log.info(f"✅ Runbook generated ({_time.time()-_t0:.1f}s)")
+
+# COMMAND ----------
+
+# ═══════════════════════════════════════════════════════════════
+# CELL 6: BUILD PIPELINE CONTEXT
 # ═══════════════════════════════════════════════════════════════
 
 from utils.auto_config import get_table_config
@@ -180,27 +224,41 @@ pipeline_ctx = dict(
 # COMMAND ----------
 
 # ═══════════════════════════════════════════════════════════════
-# CELL 6: STEP 1 — LOAD + TRANSFORM + UNION (per server)
+# CELL 7: STEP 1 — LOAD SOURCE CSVs (per server)
 # ═══════════════════════════════════════════════════════════════
 
-from utils.custom_execution_utils import step_1_load_transform_union
+from utils.custom_execution_utils import step_1_load_source
 
 _t0 = _time.time()
-transformed_df, _row_count = step_1_load_transform_union(spark, pipeline_ctx, BLOB_TABLE_BASE)
-_log.info(f"✅ Load+Transform+Union: {_row_count} rows, {len(transformed_df.columns)} columns ({_time.time()-_t0:.1f}s)")
+server_dfs = step_1_load_source(spark, pipeline_ctx, BLOB_TABLE_BASE)
+_log.info(f"✅ Loaded {len(server_dfs)} server(s) ({_time.time()-_t0:.1f}s)")
+for entry in server_dfs:
+    _log.info(f"   {entry['server_name']}: {len(entry['df'].columns)} columns")
+
+# COMMAND ----------
+
+# ═══════════════════════════════════════════════════════════════
+# CELL 8: STEP 2 — TRANSFORM + UNION (per server)
+# ═══════════════════════════════════════════════════════════════
+
+from utils.custom_execution_utils import step_2_transform_union
+
+_t0 = _time.time()
+transformed_df, _row_count = step_2_transform_union(spark, server_dfs, pipeline_ctx)
+_log.info(f"✅ Transform+Union: {_row_count} rows, {len(transformed_df.columns)} columns ({_time.time()-_t0:.1f}s)")
 _log.info(f"   Columns: {transformed_df.columns}")
 display(transformed_df.limit(5))
 
 # COMMAND ----------
 
 # ═══════════════════════════════════════════════════════════════
-# CELL 7: STEP 2 — VERIFY TARGET SCHEMA (Snowflake live)
+# CELL 9: STEP 3 — VERIFY TARGET SCHEMA (Snowflake live)
 # ═══════════════════════════════════════════════════════════════
 
-from utils.custom_execution_utils import step_2_verify_target_schema
+from utils.custom_execution_utils import step_3_verify_target_schema
 
 _t0 = _time.time()
-passed = step_2_verify_target_schema(spark, pipeline_ctx)
+passed = step_3_verify_target_schema(spark, pipeline_ctx)
 if passed:
     _log.info(f"✅ Target schema verification PASSED ({_time.time()-_t0:.1f}s)")
 else:
@@ -209,26 +267,26 @@ else:
 # COMMAND ----------
 
 # ═══════════════════════════════════════════════════════════════
-# CELL 8: STEP 3 — EXTRACT TARGET FROM SNOWFLAKE
+# CELL 10: STEP 4 — EXTRACT TARGET FROM SNOWFLAKE
 # ═══════════════════════════════════════════════════════════════
 
-from utils.custom_execution_utils import step_3_extract_target
+from utils.custom_execution_utils import step_4_extract_target
 
 _t0 = _time.time()
-target_df, _tgt_row_count = step_3_extract_target(spark, pipeline_ctx)
+target_df, _tgt_row_count = step_4_extract_target(spark, pipeline_ctx)
 _log.info(f"✅ Target loaded: {_tgt_row_count} rows, {len(target_df.columns)} columns ({_time.time()-_t0:.1f}s)")
 display(target_df.limit(5))
 
 # COMMAND ----------
 
 # ═══════════════════════════════════════════════════════════════
-# CELL 9: STEP 4 — COMPARE & GENERATE DIFF REPORT
+# CELL 11: STEP 5 — COMPARE & GENERATE DIFF REPORT
 # ═══════════════════════════════════════════════════════════════
 
-from utils.custom_execution_utils import step_4_compare
+from utils.custom_execution_utils import step_5_compare
 
 _t0 = _time.time()
-exit_code = step_4_compare(spark, transformed_df, target_df, pipeline_ctx)
+exit_code = step_5_compare(spark, transformed_df, target_df, pipeline_ctx)
 elapsed = _time.time() - _t0
 
 if exit_code == 0:
@@ -240,7 +298,7 @@ else:
 # COMMAND ----------
 
 # ═══════════════════════════════════════════════════════════════
-# CELL 10: VIEW RESULTS
+# CELL 12: VIEW RESULTS
 # ═══════════════════════════════════════════════════════════════
 
 try:
@@ -253,7 +311,7 @@ except Exception:
 # COMMAND ----------
 
 # ═══════════════════════════════════════════════════════════════
-# CELL 11: CACHE CLEANUP
+# CELL 13: CACHE CLEANUP
 # ═══════════════════════════════════════════════════════════════
 
 _log.info("Clearing any remaining cached DataFrames...")

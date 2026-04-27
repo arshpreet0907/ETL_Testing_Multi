@@ -117,28 +117,34 @@ def step_1_load_transform_union(spark, ctx: dict, blob_base: str):
         )
         logger.info("  Transformed: %d columns", len(transformed_df.columns))
 
-        server_dfs.append(transformed_df)
+        transformed_dfs.append(transformed_df)
 
     # Union all server DataFrames
-    if len(server_dfs) == 1:
-        result_df = server_dfs[0]
+    if len(transformed_dfs) == 1:
+        result_df = transformed_dfs[0]
         logger.info("Single server — no union needed")
     else:
-        result_df = server_dfs[0]
-        for sdf in server_dfs[1:]:
+        result_df = transformed_dfs[0]
+        for sdf in transformed_dfs[1:]:
             result_df = result_df.unionByName(sdf, allowMissingColumns=True)
-        logger.info("Unioned %d server DataFrames via unionByName", len(server_dfs))
+        logger.info("Unioned %d server DataFrames via unionByName", len(transformed_dfs))
 
     # Cache — reused for display + comparison
     result_df.cache()
     row_count = result_df.count()
-    logger.info("Step 1 complete: %d rows, %d columns", row_count, len(result_df.columns))
+    logger.info("Step 2 complete: %d rows, %d columns", row_count, len(result_df.columns))
 
     return result_df, row_count
 
 
-def step_2_verify_target_schema(spark, ctx: dict) -> bool:
-    """Step 2: Verify target schema (Snowflake live INFORMATION_SCHEMA)."""
+def step_1_load_transform_union(spark, ctx: dict, blob_base: str):
+    """Legacy wrapper — calls step_1_load_source + step_2_transform_union."""
+    server_dfs = step_1_load_source(spark, ctx, blob_base)
+    return step_2_transform_union(spark, server_dfs, ctx)
+
+
+def step_3_verify_target_schema(spark, ctx: dict) -> bool:
+    """Step 3: Verify target schema (Snowflake live INFORMATION_SCHEMA)."""
     if not ctx["verify_schema"] or not ctx["target_ddl"]:
         return True
 
@@ -170,12 +176,12 @@ def step_2_verify_target_schema(spark, ctx: dict) -> bool:
     return True
 
 
-def step_3_extract_target(spark, ctx: dict):
-    """Step 3: Extract target data from Snowflake via native connector."""
+def step_4_extract_target(spark, ctx: dict):
+    """Step 4: Extract target data from Snowflake via native connector."""
     target_filter = ctx["target_filter"]
 
     logger.info("=" * 60)
-    logger.info("STEP 3: Extract Target from Snowflake  [filter: %s]", target_filter["description"])
+    logger.info("STEP 4: Extract Target from Snowflake  [filter: %s]", target_filter["description"])
     logger.info("=" * 60)
 
     base_sql = resolve_query(ctx["target_query"], ctx["target_query_file"], "target")
@@ -218,7 +224,7 @@ def step_4_compare(spark, transformed_df, target_df, ctx: dict) -> int:
         output_path=ctx["report_csv"],
     )
 
-    logger.info("Step 4 complete.")
+    logger.info("Step 5 complete.")
     return exit_code
 
 

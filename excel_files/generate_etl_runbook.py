@@ -167,24 +167,27 @@ def _build_header_map(ws, header_row: int) -> dict[str, int]:
 # Parser
 # ═══════════════════════════════════════════════════════════════════════════
 
-def parse_excel(excel_path: str | Path) -> ParsedExcel:
+def parse_excel(excel_path: str | Path, run_syntax_check: bool = True) -> ParsedExcel:
     path = Path(excel_path)
     fname = path.name
     stem = path.stem  # e.g. "analytics_dw.dimensional.dim_vehicle_master"
 
     # Run syntax verification before parsing
-    from verify_excel_syntax import verify as verify_syntax
-    print(f"  Verifying syntax: {fname}")
-    vresult = verify_syntax(str(path))
-    if not vresult.passed:
-        print(f"  {vresult.summary()}")
-        raise ValueError(
-            f"Excel syntax verification FAILED for '{fname}'. "
-            f"Fix errors above before generating runbook."
-        )
-    errors = [i for i in vresult.issues if i.severity == "ERROR"]
-    warnings = [i for i in vresult.issues if i.severity == "WARNING"]
-    print(f"  Syntax OK ({len(errors)} errors, {len(warnings)} warnings)")
+    if run_syntax_check:
+        from verify_excel_syntax import verify as verify_syntax
+        print(f"  Verifying syntax: {fname}")
+        vresult = verify_syntax(str(path))
+        if not vresult.passed:
+            print(f"  {vresult.summary()}")
+            raise ValueError(
+                f"Excel syntax verification FAILED for '{fname}'. "
+                f"Fix errors above before generating runbook."
+            )
+        errors = [i for i in vresult.issues if i.severity == "ERROR"]
+        warnings = [i for i in vresult.issues if i.severity == "WARNING"]
+        print(f"  Syntax OK ({len(errors)} errors, {len(warnings)} warnings)")
+    else:
+        print(f"  Skipping syntax verification (run_syntax_check=False)")
 
     # Parse filename: <target_db>.<target_schema>.<target_table>
     parts = stem.split(".")
@@ -536,7 +539,7 @@ def build_target_ddl(parsed: ParsedExcel) -> str:
 # Extract Source SQL — V3 Combined Aliased
 # ═══════════════════════════════════════════════════════════════════════════
 
-def build_extract_sql_v3(server: ServerData, parsed: ParsedExcel) -> str:
+def build_extract_sql(server: ServerData, parsed: ParsedExcel) -> str:
     """
     Build a single combined extract SQL for a server.
 
@@ -1497,10 +1500,161 @@ def build_pipeline_log(server: ServerData, parsed: ParsedExcel) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Partial Column Filter
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _filter_parsed_for_partial(parsed: ParsedExcel, partial_cols: list[str]) -> ParsedExcel:
+    """
+    Filter a fully-parsed result down to only the requested target columns.
+
+    - Validates all requested cols exist in the mapping.
+    - Auto-includes target PK columns (so comparison doesn't break).
+    - Auto-includes source PK columns for source tables whose cols are picked.
+    - Auto-includes source columns referenced by derived transform rules of
+      selected columns (so transforms don't break).
+    - Returns a new ParsedExcel with scoped target_columns, mappings, source_tables, joins.
+    """
+    import copy
+
+    all_target_names = {c["name"] for c in parsed.target_columns}
+    requested = {c.strip().upper() for c in partial_cols}
+
+    # Validate — error on missing target col
+    missing = requested - all_target_names
+    if missing:
+        raise ValueError(
+            f"Partial mode: target column(s) not found in mapping: {sorted(missing)}. "
+            f"Available: {sorted(all_target_names)}"
+        )
+
+    # Auto-include target PKs
+    pk_set = set(parsed.target_pks)
+    if not pk_set.issubset(requested):
+        added = pk_set - requested
+        print(f"  ⚠ Auto-including target PK columns in partial set: {sorted(added)}")
+        requested |= pk_set
+
+    # Build filtered target_columns and target_pks
+    filtered_target_columns = [c for c in parsed.target_columns if c["name"] in requested]
+    filtered_target_pks = [pk for pk in parsed.target_pks if pk in requested]
+
+    # For each server, find source cols referenced by derived transforms of selected cols
+    filtered_servers: dict[str, ServerData] = {}
+    for srv_name, server in parsed.servers.items():
+        # Step 1: filter mappings to only those whose tgt_col_name is in requested
+        filtered_mappings = [cm for cm in server.mappings if cm.tgt_col_name in requested]
+
+        # Step 2: find extra source cols needed by derived transform rules
+        extra_src_cols: set[str] = set()  # source col names to auto-include
+        reserved_tokens = {
+            'val', 'if', 'else', 'and', 'or', 'not', 'None', 'True', 'False',
+            'UPPER', 'LOWER', 'TRIM', 'ROUND', 'CAST', 'CONCAT', 'COALESCE',
+            'AS', 'upper', 'lower', 'str', 'int', 'float', 'round',
+            'Y', 'N', 'T', 'F', 'YES', 'NO',
+        }
+        for cm in filtered_mappings:
+            if cm.transform_type == "derived" and cm.transform_rule:
+                refs = re.findall(r'\b([a-z_][a-z0-9_]*)\b', cm.transform_rule, re.I)
+                for ref in refs:
+                    if ref in reserved_tokens or ref == cm.src_col_name:
+                        continue
+                    # Check if ref is a source col in any source table
+                    for tbl_name, tbl_cms in server.source_tables.items():
+                        for tcm in tbl_cms:
+                            if tcm.src_col_name == ref and tcm.tgt_col_name not in requested:
+                                extra_src_cols.add(tcm.tgt_col_name)
+
+        # Add extra cols' mappings
+        if extra_src_cols:
+            print(f"  ⚠ [{srv_name}] Auto-including transform dependency cols: {sorted(extra_src_cols)}")
+            for cm in server.mappings:
+                if cm.tgt_col_name in extra_src_cols and cm not in filtered_mappings:
+                    filtered_mappings.append(cm)
+            # Also add to target columns if not already there
+            for col_name in extra_src_cols:
+                if col_name not in requested:
+                    requested.add(col_name)
+                    tc = next((c for c in parsed.target_columns if c["name"] == col_name), None)
+                    if tc and tc not in filtered_target_columns:
+                        filtered_target_columns.append(tc)
+
+        # Step 3: rebuild source_tables from filtered mappings
+        filtered_source_tables: dict[str, list[ColumnMapping]] = {}
+        for cm in filtered_mappings:
+            if cm.src_table:
+                filtered_source_tables.setdefault(cm.src_table, []).append(cm)
+
+        # Step 4: auto-include source PK columns for referenced source tables
+        for tbl_name in list(filtered_source_tables.keys()):
+            for cm in server.source_tables.get(tbl_name, []):
+                if cm.src_is_pk and cm.src_is_pk.strip().upper() in ("Y", "YES"):
+                    if cm not in filtered_source_tables[tbl_name]:
+                        print(f"  ⚠ [{srv_name}] Auto-including source PK '{cm.src_col_name}' "
+                              f"from '{tbl_name}'")
+                        filtered_source_tables[tbl_name].append(cm)
+                        if cm not in filtered_mappings:
+                            filtered_mappings.append(cm)
+                        # Ensure target col is included too
+                        if cm.tgt_col_name not in requested:
+                            requested.add(cm.tgt_col_name)
+                            tc = next((c for c in parsed.target_columns if c["name"] == cm.tgt_col_name), None)
+                            if tc and tc not in filtered_target_columns:
+                                filtered_target_columns.append(tc)
+
+        # Step 5: filter joins — keep only if their fetch_columns overlap with filtered mappings
+        filtered_tgt_set = {cm.tgt_col_name for cm in filtered_mappings}
+        filtered_joins = []
+        for jd in server.joins:
+            # Check if any fetch_column is used by a filtered mapping
+            if any(fc in filtered_tgt_set for fc in jd.fetch_columns):
+                filtered_joins.append(jd)
+            # Also keep if the join table has mappings in filtered set
+            elif jd.join_table in filtered_source_tables:
+                filtered_joins.append(jd)
+
+        # Step 6: determine main table
+        main_table = ""
+        main_db = ""
+        main_schema = ""
+        if filtered_source_tables:
+            main_table = max(filtered_source_tables, key=lambda k: len(filtered_source_tables[k]))
+            first_of_main = filtered_source_tables[main_table][0]
+            main_db = first_of_main.src_db
+            main_schema = first_of_main.src_schema
+
+        filtered_servers[srv_name] = ServerData(
+            name=server.name,
+            mappings=filtered_mappings,
+            joins=filtered_joins,
+            global_transforms=server.global_transforms,  # keep as-is (apply conditionally at runtime)
+            source_tables=filtered_source_tables,
+            main_table=main_table,
+            main_db=main_db,
+            main_schema=main_schema,
+        )
+
+    # Rebuild ParsedExcel
+    return ParsedExcel(
+        file_name=parsed.file_name,
+        target_db=parsed.target_db,
+        target_schema=parsed.target_schema,
+        target_table=parsed.target_table,
+        servers=filtered_servers,
+        target_columns=filtered_target_columns,
+        target_pks=filtered_target_pks,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Main Generator
 # ═══════════════════════════════════════════════════════════════════════════
 
-def generate_runbook(excel_path: str | Path, output_dir: str | Path = "etl_output") -> None:
+def generate_runbook(
+    excel_path: str | Path,
+    output_dir: str | Path = "etl_output",
+    partial_cols: list[str] | None = None,
+    run_syntax_check: bool = True,
+) -> None:
     path = Path(excel_path)
     out_base = Path(output_dir)
 
@@ -1511,7 +1665,14 @@ def generate_runbook(excel_path: str | Path, output_dir: str | Path = "etl_outpu
         print(f"  Delete it to force re-parse from Excel.")
 
     print(f"\n  Parsing: {path.name}")
-    parsed = parse_excel(path)
+    parsed = parse_excel(path, run_syntax_check=run_syntax_check)
+
+    # Apply partial column filter if requested
+    if partial_cols:
+        print(f"\n  Partial mode: filtering to {len(partial_cols)} target columns")
+        parsed = _filter_parsed_for_partial(parsed, partial_cols)
+        print(f"  After filtering: {len(parsed.target_columns)} target columns, "
+              f"{sum(len(s.mappings) for s in parsed.servers.values())} mappings")
 
     # Output folder = target_table name (sanitized)
     table_folder = parsed.target_table.replace(".", "_")
@@ -1540,7 +1701,7 @@ def generate_runbook(excel_path: str | Path, output_dir: str | Path = "etl_outpu
         print(f"  OK  {srv_name}/source_tables/ ({n_ddls} DDL files)")
 
         # Extract SQL
-        extract_sql = build_extract_sql_v3(server, parsed)
+        extract_sql = build_extract_sql(server, parsed)
         (srv_dir / "03_extract_source.sql").write_text(extract_sql, encoding="utf-8")
         print(f"  OK  {srv_name}/03_extract_source.sql")
 
@@ -1564,10 +1725,19 @@ def generate_runbook(excel_path: str | Path, output_dir: str | Path = "etl_outpu
 # Edit these variables before running:
 EXCEL_FILES = [
     "analytics_dw.public.dim_vehicle_master.xlsx",
-    "analytics_dw.public.fact_commercial.xlsx",
-    "analytics_dw.public.fact_production.xlsx",
+    # "analytics_dw.public.fact_commercial.xlsx",
+    # "analytics_dw.public.fact_production.xlsx",
 ]
 OUTPUT_DIR = "etl_output"
+
+# Set to a list of target column names for partial extraction.
+# Example: ["VIN", "MODEL_YEAR", "PLANT_CODE"]
+# Set to None or [] for full table extraction (default).
+PARTIAL_TARGET_COLS: list[str] | None = ["MODEL_NAME","ENGINE_TYPE","PART_STOCK_QTY","CONTACT_DEPARTMENT"]
+
+# Set to False to skip syntax verification before parsing.
+# Useful when re-running with different partial_cols on an already-verified Excel.
+RUN_SYNTAX_CHECK: bool = True
 
 
 if __name__ == "__main__":
@@ -1580,7 +1750,11 @@ if __name__ == "__main__":
             print(f"  SKIP: {p.name} not found")
             continue
         try:
-            generate_runbook(p, out)
+            generate_runbook(
+                p, out,
+                partial_cols=PARTIAL_TARGET_COLS or None,
+                run_syntax_check=RUN_SYNTAX_CHECK,
+            )
         except Exception as e:
             print(f"  ERROR: {p.name}: {e}")
             import traceback
