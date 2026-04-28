@@ -49,7 +49,7 @@ JOINS_HEADERS = [
     "join_type", "left_key", "right_key", "fetch_columns",
 ]
 
-SKIP_SHEETS = {"_joins"}
+SKIP_SHEETS = {"_joins", "_parameters"}
 
 # Global transforms marker and headers
 GT_MARKER = "_global_transforms"
@@ -161,6 +161,61 @@ def _build_header_map(ws, header_row: int) -> dict[str, int]:
         if name:
             hmap[name] = c
     return hmap
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Parameters Sheet Parsing
+# ═══════════════════════════════════════════════════════════════════════════
+
+def parse_parameters_sheet(wb) -> dict[str, str]:
+    """
+    Parse the _parameters sheet from a workbook.
+
+    Returns a dict of {PARAMETER_NAME: parameter_value} for all non-blank rows.
+    Returns empty dict if the sheet does not exist.
+    """
+    # Find _parameters sheet (case-insensitive)
+    params_sheet_name = None
+    for s in wb.sheetnames:
+        if s.lower() == "_parameters":
+            params_sheet_name = s
+            break
+
+    if params_sheet_name is None:
+        return {}
+
+    ws = wb[params_sheet_name]
+    if (ws.max_row or 0) < 2:
+        return {}
+
+    # Build header map from row 1
+    hmap: dict[str, int] = {}
+    for c in range(1, (ws.max_column or 1) + 1):
+        name = _clean(ws.cell(1, c).value).lower()
+        if name:
+            hmap[name] = c
+
+    name_col = hmap.get("parameter_name")
+    value_col = hmap.get("parameter_value")
+    if not name_col or not value_col:
+        print(f"  WARNING: _parameters sheet missing required headers (parameter_name, parameter_value)")
+        return {}
+
+    parameters: dict[str, str] = {}
+    for r in range(2, (ws.max_row or 1) + 1):
+        param_name = _clean(ws.cell(r, name_col).value)
+        param_value = _clean(ws.cell(r, value_col).value)
+        if not param_name:
+            continue
+        # Store with uppercase key for consistent lookup
+        parameters[param_name.strip().upper()] = param_value
+
+    return parameters
+
+
+def build_parameters_json(parameters: dict[str, str]) -> str:
+    """Serialize parameters dict to a pretty-printed JSON string."""
+    return json.dumps(parameters, indent=2, ensure_ascii=False)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1667,6 +1722,11 @@ def generate_runbook(
     print(f"\n  Parsing: {path.name}")
     parsed = parse_excel(path, run_syntax_check=run_syntax_check)
 
+    # Parse _parameters sheet and generate parameters.json
+    wb_params = openpyxl.load_workbook(str(path), data_only=True)
+    parameters = parse_parameters_sheet(wb_params)
+    wb_params.close()
+
     # Apply partial column filter if requested
     if partial_cols:
         print(f"\n  Partial mode: filtering to {len(partial_cols)} target columns")
@@ -1689,6 +1749,15 @@ def generate_runbook(
         build_extract_target(parsed), encoding="utf-8"
     )
     print(f"  OK  05_extract_target_sf.sql")
+
+    # Parameters JSON (from _parameters sheet)
+    if parameters:
+        (table_dir / "parameters.json").write_text(
+            build_parameters_json(parameters), encoding="utf-8"
+        )
+        print(f"  OK  parameters.json ({len(parameters)} parameter(s))")
+    else:
+        print(f"  SKIP parameters.json (no _parameters sheet or empty)")
 
     # Per-server files
     for srv_name, server in parsed.servers.items():
@@ -1725,15 +1794,15 @@ def generate_runbook(
 # Edit these variables before running:
 EXCEL_FILES = [
     "analytics_dw.public.dim_vehicle_master.xlsx",
-    # "analytics_dw.public.fact_commercial.xlsx",
-    # "analytics_dw.public.fact_production.xlsx",
+    "analytics_dw.public.fact_commercial.xlsx",
+    "analytics_dw.public.fact_production.xlsx",
 ]
 OUTPUT_DIR = "etl_output"
 
 # Set to a list of target column names for partial extraction.
 # Example: ["VIN", "MODEL_YEAR", "PLANT_CODE"]
 # Set to None or [] for full table extraction (default).
-PARTIAL_TARGET_COLS: list[str] | None = ["MODEL_NAME","ENGINE_TYPE","PART_STOCK_QTY","CONTACT_DEPARTMENT"]
+PARTIAL_TARGET_COLS: list[str] | None = None#["MODEL_NAME","ENGINE_TYPE","PART_STOCK_QTY","CONTACT_DEPARTMENT"]
 
 # Set to False to skip syntax verification before parsing.
 # Useful when re-running with different partial_cols on an already-verified Excel.

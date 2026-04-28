@@ -105,7 +105,7 @@ EXPECTED_HEADERS = {
 VALID_TRANSFORM_TYPES = {"direct", "rename", "cast", "derived", "constant", "drop"}
 
 # Sheets to skip
-SKIP_SHEETS = {"_joins"}
+SKIP_SHEETS = {"_joins", "_parameters"}
 
 # Global transforms marker
 GT_MARKER = "_global_transforms"
@@ -124,6 +124,10 @@ JOINS_REQUIRED_COLS = {
     "sheet_name", "join_alias", "join_table", "join_type",
     "left_key", "right_key", "fetch_columns",
 }
+
+# Parameters sheet constants
+PARAMETERS_SHEET = "_parameters"
+PARAMETERS_REQUIRED_HEADERS = {"sr_no", "parameter_name", "parameter_value"}
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +180,11 @@ def verify(file_path: str) -> VerificationResult:
     if "_joins" in [s.lower() for s in wb.sheetnames]:
         jws_name = next(s for s in wb.sheetnames if s.lower() == "_joins")
         _verify_joins_sheet(wb[jws_name], server_sheets, result)
+
+    # Verify _parameters sheet if present
+    if "_parameters" in [s.lower() for s in wb.sheetnames]:
+        pws_name = next(s for s in wb.sheetnames if s.lower() == "_parameters")
+        _verify_parameters_sheet(wb[pws_name], result)
 
     # Cross-sheet validation (X1-X3)
     if len(sheet_targets) > 1:
@@ -423,6 +432,55 @@ def _verify_joins_sheet(ws, server_sheets: list, result: VerificationResult):
                         f"'{join_table}' (previously '{prev}') in sheet '{sn}'"))
             else:
                 aliases_per_sheet[sn][join_alias] = join_table.upper() if join_table else ""
+
+
+def _verify_parameters_sheet(ws, result: VerificationResult):
+    """P1, P2, P3: Validate the _parameters sheet."""
+    if ws.max_row is None or ws.max_row < 2:
+        return
+
+    max_col = ws.max_column or 0
+
+    # Build header map from row 1
+    hdr = {}
+    for c in range(1, max_col + 1):
+        n = _norm(ws.cell(1, c).value)
+        if n:
+            hdr[n] = c
+
+    # P1: Required headers
+    missing_hdrs = PARAMETERS_REQUIRED_HEADERS - set(hdr.keys())
+    if missing_hdrs:
+        result.issues.append(Issue("ERROR", "_parameters", 1, "P1",
+            f"Missing required headers: {missing_hdrs}"))
+        return
+
+    def _pget(row, name):
+        c = hdr.get(name)
+        return _clean(ws.cell(row, c).value) if c else ""
+
+    seen_names = {}
+    for r in range(2, ws.max_row + 1):
+        row_vals = [_clean(ws.cell(r, c).value) for c in range(1, max_col + 1)]
+        if all(_is_blank(v) for v in row_vals):
+            continue
+
+        param_name = _pget(r, "parameter_name")
+
+        # P2: parameter_name not blank
+        if _is_blank(param_name):
+            result.issues.append(Issue("ERROR", "_parameters", r, "P2",
+                "parameter_name is blank"))
+            continue
+
+        # P3: No duplicate parameter_name
+        param_upper = param_name.strip().upper()
+        if param_upper in seen_names:
+            result.issues.append(Issue("WARNING", "_parameters", r, "P3",
+                f"Duplicate parameter_name '{param_name}' "
+                f"(first seen at row {seen_names[param_upper]})"))
+        else:
+            seen_names[param_upper] = r
 
 
 def _verify_cross_sheets(sheet_targets: dict, result: VerificationResult):

@@ -41,7 +41,7 @@ JOINS_SHEET = "_joins"
 
 # Sheets to always skip (case-insensitive prefix/glob)
 SKIP_SHEETS = {
-    "_joins", "versionhistory", "introduction", "loading steps",
+    "_joins", "_parameters", "versionhistory", "introduction", "loading steps",
     "sql-script", "load-ref_category_type",
 }
 SKIP_PREFIXES = ("retired", "data prof")

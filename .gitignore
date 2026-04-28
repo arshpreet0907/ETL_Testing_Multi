@@ -6,5 +6,7 @@ __pycache__
 output/*/*/*.json
 output/*/*/*.csv
 output/*/*/*.schema.json
+output/*.csv
+output/*.json
 jars/*
-
+excel_files/etl_output
