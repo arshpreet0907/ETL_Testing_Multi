@@ -1,19 +1,25 @@
 """
-excel_schema_parser_v2.py
--------------------------
-Multi-source ETL parser (v2) — reads Excel mapping specs following the
-standard syntax defined in docs/excel_syntax_guide.md v2.
+excel_schema_parser.py
+-----------------------
+Single source-of-truth Excel mapping parser for the ETL pipeline.
 
-Produces a single JSON output with:
+Reads Excel mapping specs using the project format (src_db, tgt_col_name headers)
+and produces a structured dict with:
   - target_db / target_table (from filename)
   - unified target schema
   - per-server: source_tables, column_mappings, joins, global_transforms
   - cross-sheet consistency_errors
+  - parameters (from _parameters sheet)
 
-NOT backward compatible with v1.
+Call chain:
+    custom_execution → generate_etl_runbook → excel_schema_parser → verify_excel_syntax
 
-Usage:
-    python excel_schema_parser_v2.py <excel_file> [--output out.json] [--pretty]
+Usage (standalone — produces JSON):
+    python excel_schema_parser.py
+
+Programmatic (returns dict, no JSON written):
+    from excel_schema_parser import parse_excel
+    result = parse_excel("analytics_dw.public.dim_vehicle_master.xlsx")
 """
 
 from __future__ import annotations
@@ -22,7 +28,6 @@ import json
 import re
 import sys
 from dataclasses import dataclass, field, asdict
-from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any
 
@@ -39,22 +44,10 @@ FILENAME_RE = re.compile(
 
 JOINS_SHEET = "_joins"
 
-# Sheets to always skip (case-insensitive prefix/glob)
-SKIP_SHEETS = {
-    "_joins", "_parameters", "versionhistory", "introduction", "loading steps",
-    "sql-script", "load-ref_category_type",
-}
-SKIP_PREFIXES = ("retired", "data prof")
+# Sheets to always skip (case-insensitive)
+SKIP_SHEETS = {"_joins", "_parameters"}
 
-# Required target headers (normalised lowercase)
-REQUIRED_TGT_HEADERS = {"schema", "table", "column", "data type", "allow nulls", "transformation"}
-# Required source headers (normalised lowercase)
-REQUIRED_SRC_HEADERS = {"database", "data type"}
-# Source headers with aliases
-SRC_TABLE_ALIASES = {"table name", "table"}
-SRC_FIELD_ALIASES = {"field name", "field"}
-
-# Global transforms marker
+# Global transforms marker and headers
 GT_MARKER = "_global_transforms"
 GT_HEADERS_EXPECTED = {"order", "operation", "parameters", "condition", "notes"}
 
@@ -73,13 +66,9 @@ REPLACE_PATTERN = re.compile(
 
 # Joins required headers
 JOINS_REQUIRED = {
-    "sheet_name", "left_table", "join_alias", "join_table",
+    "sheet_name", "join_alias", "join_table",
     "join_type", "left_key", "right_key", "fetch_columns",
 }
-
-# D13: Validate that Field Desc matches target Column (case-insensitive).
-# Set to False to suppress these warnings.
-VALIDATE_FIELD_DESC = False
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -93,9 +82,10 @@ class TargetColumnDef:
     dtype: str
     nullable: bool
     is_pk: bool
-    pk_marker: str       # e.g. "PK", "SK,PK", "BK", ""
-    default_val: str
-    null_handling: str   # e.g. "fill:0", "fill:UNSPECIFIED", ""
+    pk_marker: str          # e.g. "Y", "N", ""
+    default_val: str        # from tgt_default_val column
+    force_dtype: str        # from force_dtype column
+    null_handling: str      # explicit null_handling column or parsed from Notes
 
 
 @dataclass
@@ -104,24 +94,33 @@ class SourceTableRef:
     database: str
     schema: str
     table: str
-    columns: list[dict] = field(default_factory=list)   # [{name, dtype, nullable, is_bk}]
+    columns: list[dict] = field(default_factory=list)   # [{name, dtype, nullable, is_pk}]
 
 
 @dataclass
 class ColumnMapping:
     """One row mapping: source field → target column with transform."""
+    # Target side
     target_column: str
     target_dtype: str
     target_nullable: bool
     target_pk_marker: str
+    target_default_val: str
+    # Source side
     source_database: str
     source_schema: str
     source_table: str
     source_field: str
     source_dtype: str
-    source_desc: str
-    transform: str          # raw Transformation cell
-    null_handling: str      # parsed from Notes
+    source_nullable: str
+    source_is_pk: str
+    source_is_unique: str
+    # Transform
+    transform_type: str     # direct, rename, cast, derived, constant, drop
+    transform_rule: str     # the rule expression
+    # Metadata
+    force_dtype: str
+    null_handling: str      # explicit column value or parsed from Notes
     notes: str
 
 
@@ -129,12 +128,13 @@ class ColumnMapping:
 class JoinDef:
     """A join definition from the _joins sheet."""
     sheet_name: str
-    left_table: str
     join_alias: str
     join_table: str
     join_db: str
     join_schema: str
     join_type: str          # LEFT / INNER / RIGHT / FULL
+    left_key: str           # first left key (convenience)
+    right_key: str          # first right key (convenience)
     key_pairs: list[tuple[str, str]] = field(default_factory=list)
     fetch_columns: list[str] = field(default_factory=list)
 
@@ -160,17 +160,6 @@ class ServerData:
     target_columns: list[TargetColumnDef] = field(default_factory=list)
 
 
-@dataclass
-class ParseResult:
-    """Complete parser output."""
-    file_name: str
-    target_db: str
-    target_table: str
-    target_schema: dict = field(default_factory=dict)
-    servers: dict[str, dict] = field(default_factory=dict)
-    consistency_errors: list[str] = field(default_factory=list)
-
-
 # ═══════════════════════════════════════════════════════════════════════════
 # Helper Utilities
 # ═══════════════════════════════════════════════════════════════════════════
@@ -180,7 +169,6 @@ def _clean(val: Any) -> str:
     if val is None:
         return ""
     s = str(val).strip()
-    # Remove non-breaking spaces
     s = s.replace('\xa0', ' ').strip()
     return s
 
@@ -193,7 +181,7 @@ def _norm(val: Any) -> str:
 def _bool_nullable(val: str) -> bool:
     """Parse Allow Nulls field → True if nullable."""
     v = val.strip().upper()
-    return v in ("YES", "Y", "TRUE", "1")
+    return v not in ("N", "NO", "FALSE", "0")
 
 
 def _parse_null_handling(notes: str) -> str:
@@ -222,29 +210,16 @@ def _source_table_key(db: str, schema: str, table: str) -> str:
 def _should_skip_sheet(name: str) -> bool:
     """Check if a sheet should be skipped based on name."""
     nl = name.lower().strip()
-    if nl in SKIP_SHEETS:
-        return True
-    for prefix in SKIP_PREFIXES:
-        if nl.startswith(prefix):
-            return True
-    return False
+    return nl in SKIP_SHEETS
 
 
 def _is_server_sheet(ws) -> bool:
-    """Check if worksheet has a recognisable header row in rows 1–14.
-    Supports two formats:
-      - v2 format: headers contain 'Schema' + 'Column'
-      - project format: headers contain 'src_db' or 'src_col_name'
-    """
-    for row_idx in range(1, min(15, ws.max_row + 1)):
+    """Check if worksheet has project-format headers (src_db + tgt_col_name)."""
+    for row_idx in range(1, min(15, (ws.max_row or 0) + 1)):
         cells = []
-        for col_idx in range(1, min(ws.max_column + 1, 25)):
+        for col_idx in range(1, min((ws.max_column or 0) + 1, 25)):
             v = _norm(ws.cell(row_idx, col_idx).value)
             cells.append(v)
-        # v2 format
-        if "schema" in cells and "column" in cells:
-            return True
-        # project format (src_db, src_col_name, tgt_col_name)
         if "src_db" in cells and "tgt_col_name" in cells:
             return True
     return False
@@ -271,186 +246,64 @@ def discover_sheets(wb) -> tuple[list[str], bool]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Header Detection
+# Header Detection (project format only)
 # ═══════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class HeaderMap:
     """Maps header names to column indices for one sheet."""
     header_row: int
-    separator_col: int
-    tgt_headers: dict[str, int]   # normalised name → col index
-    src_headers: dict[str, int]   # normalised name → col index
+    headers: dict[str, int]   # normalised name → col index
 
 
 def detect_headers(ws) -> HeaderMap:
     """
-    Scan rows 1–14 for the header row.
-    Supports two formats:
-      - v2 format: 'Schema' + 'Column' with separator column splitting target/source sides
-      - project format: flat headers like 'src_db', 'tgt_col_name' (no separator)
+    Scan rows 1–14 for the header row with project-format headers
+    (src_db, tgt_col_name, etc.) and build a header→column index map.
     """
     header_row = -1
-    is_project_format = False
     max_col = min(ws.max_column or 1, 30)
 
-    # Find header row
     for row_idx in range(1, min(15, (ws.max_row or 1) + 1)):
         row_vals = [_norm(ws.cell(row_idx, c).value) for c in range(1, max_col + 1)]
-        if "schema" in row_vals and "column" in row_vals:
-            header_row = row_idx
-            break
         if "src_db" in row_vals and "tgt_col_name" in row_vals:
             header_row = row_idx
-            is_project_format = True
             break
 
     if header_row < 0:
-        raise ValueError(f"Sheet '{ws.title}': cannot find header row")
+        raise ValueError(f"Sheet '{ws.title}': cannot find header row with src_db and tgt_col_name")
 
-    if is_project_format:
-        # Project format: flat headers, no separator column
-        # Map src_* headers as source-side, tgt_* and transform_* as target-side
-        tgt_headers: dict[str, int] = {}
-        src_headers: dict[str, int] = {}
-        for col_idx in range(1, max_col + 1):
-            name = _norm(ws.cell(header_row, col_idx).value)
-            if not name:
-                continue
-            # Route headers to appropriate side based on prefix
-            if name.startswith("src_"):
-                src_headers[name] = col_idx
-                # Also map without prefix for compatibility (e.g. "database" → src_db)
-                short = name[4:]  # strip "src_"
-                if short == "db":
-                    src_headers["database"] = col_idx
-                elif short == "col_name":
-                    src_headers["field name"] = col_idx
-                    src_headers["field"] = col_idx
-                elif short == "table":
-                    src_headers["table name"] = col_idx
-                    src_headers["table"] = col_idx
-                elif short == "schema":
-                    src_headers["schema"] = col_idx
-                elif short == "dtype":
-                    src_headers["data type"] = col_idx
-                elif short == "is_pk":
-                    src_headers["business key (y/n)"] = col_idx
-                else:
-                    src_headers[short] = col_idx
-            elif name.startswith("tgt_"):
-                tgt_headers[name] = col_idx
-                short = name[4:]
-                if short == "col_name":
-                    tgt_headers["column"] = col_idx
-                elif short == "dtype":
-                    tgt_headers["data type"] = col_idx
-                elif short == "nullable":
-                    tgt_headers["allow nulls"] = col_idx
-                elif short == "is_pk":
-                    tgt_headers["bk/sk/pk"] = col_idx
-                elif short == "default_val":
-                    tgt_headers["default_val"] = col_idx
-                else:
-                    tgt_headers[short] = col_idx
-            elif name == "transform_type":
-                tgt_headers["transformation"] = col_idx
-                tgt_headers["transform_type"] = col_idx
-            elif name == "transform_rule":
-                tgt_headers["transform_rule"] = col_idx
-            elif name == "null_handling":
-                tgt_headers["null_handling"] = col_idx
-            elif name == "notes":
-                tgt_headers["notes"] = col_idx
-            elif name == "force_dtype":
-                tgt_headers["force_dtype"] = col_idx
-
-        return HeaderMap(
-            header_row=header_row,
-            separator_col=-1,
-            tgt_headers=tgt_headers,
-            src_headers=src_headers,
-        )
-
-    # v2 format: find separator column
-    row_vals = [_clean(ws.cell(header_row, c).value) for c in range(1, max_col + 1)]
-    separator_col = -1
-    for i in range(1, len(row_vals) - 1):
-        if not row_vals[i] and row_vals[i - 1] and any(row_vals[j] for j in range(i + 1, len(row_vals))):
-            separator_col = i + 1  # 1-based
-            break
-
-    if separator_col < 0:
-        separator_col = max_col + 1
-
-    tgt_headers = {}
-    src_headers = {}
+    headers: dict[str, int] = {}
     for col_idx in range(1, max_col + 1):
         name = _norm(ws.cell(header_row, col_idx).value)
-        if not name:
-            continue
-        if col_idx < separator_col:
-            tgt_headers[name] = col_idx
-        elif col_idx > separator_col:
-            src_headers[name] = col_idx
+        if name:
+            headers[name] = col_idx
 
-    return HeaderMap(
-        header_row=header_row,
-        separator_col=separator_col,
-        tgt_headers=tgt_headers,
-        src_headers=src_headers,
-    )
+    return HeaderMap(header_row=header_row, headers=headers)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Data Row Parsing
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _get_tgt_col(hdr: HeaderMap, ws, row: int, name: str) -> str:
-    """Read a target-side cell by header name."""
-    col_idx = hdr.tgt_headers.get(name)
-    if col_idx is None:
-        return ""
-    return _clean(ws.cell(row, col_idx).value)
-
-
-def _get_src_col(hdr: HeaderMap, ws, row: int, name: str) -> str:
-    """Read a source-side cell by header name, trying aliases."""
-    col_idx = hdr.src_headers.get(name)
-    if col_idx is None:
-        return ""
-    return _clean(ws.cell(row, col_idx).value)
-
-
-def _resolve_src_header(hdr: HeaderMap, primary: str, aliases: set[str]) -> str:
-    """Find the actual header name from a set of aliases."""
-    nl = primary.lower()
-    if nl in hdr.src_headers:
-        return nl
-    for alias in aliases:
-        if alias.lower() in hdr.src_headers:
-            return alias.lower()
-    return nl
-
-
-def parse_data_rows(ws, hdr: HeaderMap) -> tuple[list[ColumnMapping], list[TargetColumnDef], dict[str, SourceTableRef], int, list[str]]:
+def parse_data_rows(ws, hdr: HeaderMap) -> tuple[
+    list[ColumnMapping], list[TargetColumnDef], dict[str, SourceTableRef]
+]:
     """
     Parse all data rows from the header row to the global transforms marker or end.
 
-    Returns:
-        (column_mappings, target_columns, source_tables, last_data_row, field_desc_warnings)
+    Returns (column_mappings, target_columns, source_tables).
     """
     mappings: list[ColumnMapping] = []
     target_cols: list[TargetColumnDef] = []
     source_tables: dict[str, SourceTableRef] = {}
     seen_tgt_cols: set[str] = set()
-    field_desc_warnings: list[str] = []
 
-    # Resolve source header aliases
-    src_table_key = _resolve_src_header(hdr, "table name", SRC_TABLE_ALIASES)
-    src_field_key = _resolve_src_header(hdr, "field name", SRC_FIELD_ALIASES)
-
-    last_data_row = hdr.header_row
+    def _get(row: int, name: str) -> str:
+        col_idx = hdr.headers.get(name)
+        if col_idx is None:
+            return ""
+        return _clean(ws.cell(row, col_idx).value)
 
     for row_idx in range(hdr.header_row + 1, (ws.max_row or hdr.header_row) + 1):
         # Check for global transforms marker
@@ -458,51 +311,56 @@ def parse_data_rows(ws, hdr: HeaderMap) -> tuple[list[ColumnMapping], list[Targe
         if cell_a.lower() == GT_MARKER:
             break
 
-        # Check if entire row is blank
+        # Check for legend row
+        if cell_a.lower() == "transform type legend":
+            break
+
+        # Skip fully blank rows
         all_blank = True
-        for col_idx in range(1, min((ws.max_column or 1) + 1, 25)):
-            if _clean(ws.cell(row_idx, col_idx).value):
+        for c in range(1, min((ws.max_column or 1) + 1, 20)):
+            if _clean(ws.cell(row_idx, c).value):
                 all_blank = False
                 break
         if all_blank:
             continue
 
-        last_data_row = row_idx
-
         # Read target side
-        tgt_schema = _get_tgt_col(hdr, ws, row_idx, "schema")
-        tgt_table = _get_tgt_col(hdr, ws, row_idx, "table")
-        tgt_col = _get_tgt_col(hdr, ws, row_idx, "column")
-        tgt_dtype = _get_tgt_col(hdr, ws, row_idx, "data type")
-        tgt_pk = _get_tgt_col(hdr, ws, row_idx, "bk/sk/pk")
-        tgt_nulls = _get_tgt_col(hdr, ws, row_idx, "allow nulls")
-        tgt_transform = _get_tgt_col(hdr, ws, row_idx, "transformation") or _get_tgt_col(hdr, ws, row_idx, "transform_type")
-        tgt_notes = _get_tgt_col(hdr, ws, row_idx, "notes")
+        tgt_col = _get(row_idx, "tgt_col_name")
+        tgt_dtype = _get(row_idx, "tgt_dtype")
+        tgt_nullable = _get(row_idx, "tgt_nullable")
+        tgt_is_pk = _get(row_idx, "tgt_is_pk")
+        tgt_default_val = _get(row_idx, "tgt_default_val")
 
+        # Read source side
+        src_db = _get(row_idx, "src_db")
+        src_schema = _get(row_idx, "src_schema")
+        src_table = _get(row_idx, "src_table")
+        src_col = _get(row_idx, "src_col_name")
+        src_dtype = _get(row_idx, "src_dtype")
+        src_nullable = _get(row_idx, "src_nullable")
+        src_is_pk = _get(row_idx, "src_is_pk")
+        src_is_unique = _get(row_idx, "src_is_unique")
+
+        # Read transform
+        transform_type = _get(row_idx, "transform_type")
+        transform_rule = _get(row_idx, "transform_rule")
+
+        # Read metadata
+        force_dtype = _get(row_idx, "force_dtype")
+        null_handling_explicit = _get(row_idx, "null_handling")
+        notes = _get(row_idx, "notes")
+
+        if not tgt_col and not transform_type:
+            continue
         if not tgt_col:
             continue
 
-        # Read source side
-        src_db = _get_src_col(hdr, ws, row_idx, "database")
-        src_schema = _get_src_col(hdr, ws, row_idx, "schema")
-        src_table = _get_src_col(hdr, ws, row_idx, src_table_key)
-        src_field = _get_src_col(hdr, ws, row_idx, src_field_key)
-        src_desc = _get_src_col(hdr, ws, row_idx, "field desc")
-        # D13: Field Desc should match target Column (case-insensitive)
-        if VALIDATE_FIELD_DESC and src_desc and tgt_col and src_desc.strip().upper() != tgt_col.strip().upper():
-            warn = (f"Row {row_idx}: Field Desc '{src_desc}' does not match "
-                    f"target Column '{tgt_col}' (case-insensitive)")
-            field_desc_warnings.append(warn)
-            print(f"  WARNING [D13]: {warn}")
-        src_dtype = _get_src_col(hdr, ws, row_idx, "data type")
-        src_bk = _get_src_col(hdr, ws, row_idx, "business key (y/n)")
+        # Determine null_handling: explicit column wins, else parse from Notes
+        null_handling = null_handling_explicit or _parse_null_handling(notes)
 
-        # Parse null handling from Notes
-        null_handling = _parse_null_handling(tgt_notes)
-
-        # Determine PK
-        is_pk = bool(tgt_pk and "PK" in tgt_pk.upper())
-        nullable = _bool_nullable(tgt_nulls) if tgt_nulls else True
+        # Parse PK and nullable
+        is_pk = tgt_is_pk.upper() in ("Y", "YES") if tgt_is_pk else False
+        nullable = _bool_nullable(tgt_nullable) if tgt_nullable else True
 
         # Build target column def (deduplicated)
         tgt_col_upper = tgt_col.upper()
@@ -510,11 +368,12 @@ def parse_data_rows(ws, hdr: HeaderMap) -> tuple[list[ColumnMapping], list[Targe
             seen_tgt_cols.add(tgt_col_upper)
             target_cols.append(TargetColumnDef(
                 name=tgt_col_upper,
-                dtype=tgt_dtype.upper() if tgt_dtype else "",
+                dtype=tgt_dtype,
                 nullable=nullable,
                 is_pk=is_pk,
-                pk_marker=tgt_pk,
-                default_val="",
+                pk_marker=tgt_is_pk,
+                default_val=tgt_default_val,
+                force_dtype=force_dtype,
                 null_handling=null_handling,
             ))
 
@@ -525,34 +384,41 @@ def parse_data_rows(ws, hdr: HeaderMap) -> tuple[list[ColumnMapping], list[Targe
                 source_tables[st_key] = SourceTableRef(
                     database=src_db, schema=src_schema, table=src_table, columns=[],
                 )
-            # Add column to source table if not already there
             existing_cols = {c["name"].upper() for c in source_tables[st_key].columns}
-            if src_field and src_field.upper() not in existing_cols:
+            if src_col and src_col.upper() not in existing_cols:
                 source_tables[st_key].columns.append({
-                    "name": src_field,
+                    "name": src_col,
                     "dtype": src_dtype,
-                    "nullable": _bool_nullable(tgt_nulls) if tgt_nulls else True,
-                    "is_bk": src_bk.upper() in ("Y", "YES") if src_bk else False,
+                    "nullable": src_nullable,
+                    "is_pk": src_is_pk,
                 })
+
+        # Normalize transform_type
+        tt = transform_type.lower().strip() if transform_type else "direct"
 
         # Build mapping
         mappings.append(ColumnMapping(
             target_column=tgt_col_upper,
-            target_dtype=tgt_dtype.upper() if tgt_dtype else "",
+            target_dtype=tgt_dtype,
             target_nullable=nullable,
-            target_pk_marker=tgt_pk,
+            target_pk_marker=tgt_is_pk,
+            target_default_val=tgt_default_val,
             source_database=src_db,
             source_schema=src_schema,
             source_table=src_table,
-            source_field=src_field,
+            source_field=src_col,
             source_dtype=src_dtype,
-            source_desc=src_desc,
-            transform=tgt_transform,
+            source_nullable=src_nullable,
+            source_is_pk=src_is_pk,
+            source_is_unique=src_is_unique,
+            transform_type=tt,
+            transform_rule=transform_rule,
+            force_dtype=force_dtype,
             null_handling=null_handling,
-            notes=tgt_notes,
+            notes=notes,
         ))
 
-    return mappings, target_cols, source_tables, last_data_row, field_desc_warnings
+    return mappings, target_cols, source_tables
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -573,7 +439,6 @@ def parse_global_transforms(ws, hdr: HeaderMap) -> list[GlobalTransform]:
     if marker_row < 0:
         return []
 
-    # Find GT headers in the row after marker
     gt_hdr_row = marker_row + 1
     if gt_hdr_row > (ws.max_row or 0):
         return []
@@ -598,7 +463,7 @@ def parse_global_transforms(ws, hdr: HeaderMap) -> list[GlobalTransform]:
         try:
             order_int = int(order_val)
         except (ValueError, TypeError):
-            order_int = len(transforms) + 1
+            break  # non-numeric order = end of section
 
         params = _clean(ws.cell(row_idx, gt_hdr_map.get("parameters", 0)).value) if "parameters" in gt_hdr_map else ""
         condition = _clean(ws.cell(row_idx, gt_hdr_map.get("condition", 0)).value) if "condition" in gt_hdr_map else ""
@@ -624,19 +489,13 @@ def parse_joins_sheet(ws) -> dict[str, list[JoinDef]]:
     Parse the _joins sheet into JoinDef objects grouped by sheet_name.
     Supports composite keys (multiple rows with same alias are merged).
     """
-    # Read header row
     header_map: dict[str, int] = {}
     for col_idx in range(1, (ws.max_column or 1) + 1):
         val = _norm(ws.cell(1, col_idx).value)
         if val:
             header_map[val] = col_idx
 
-    missing = JOINS_REQUIRED - set(header_map.keys())
-    if missing:
-        print(f"  WARNING: _joins sheet missing columns: {missing}")
-
     # Temporary storage for composite key grouping
-    # key = (sheet_name, join_alias, join_table)
     grouped: dict[tuple, JoinDef] = {}
     order: list[tuple] = []
 
@@ -649,7 +508,6 @@ def parse_joins_sheet(ws) -> dict[str, list[JoinDef]]:
         if not sheet_name:
             continue
 
-        left_table = _get("left_table")
         join_alias = _get("join_alias")
         join_table = _get("join_table")
         join_db = _get("join_db")
@@ -672,12 +530,13 @@ def parse_joins_sheet(ws) -> dict[str, list[JoinDef]]:
             fetch_cols = [c.strip() for c in fetch_raw.split(",") if c.strip()]
             jd = JoinDef(
                 sheet_name=sheet_name,
-                left_table=left_table,
                 join_alias=join_alias,
                 join_table=join_table,
                 join_db=join_db,
                 join_schema=join_schema,
                 join_type=join_type,
+                left_key=left_key,
+                right_key=right_key,
                 key_pairs=[(left_key, right_key)],
                 fetch_columns=fetch_cols,
             )
@@ -691,6 +550,53 @@ def parse_joins_sheet(ws) -> dict[str, list[JoinDef]]:
         result.setdefault(jd.sheet_name, []).append(jd)
 
     return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# _parameters Sheet Parsing
+# ═══════════════════════════════════════════════════════════════════════════
+
+def parse_parameters_sheet(wb) -> dict[str, str]:
+    """
+    Parse the _parameters sheet from a workbook.
+
+    Returns a dict of {PARAMETER_NAME: parameter_value} for all non-blank rows.
+    Returns empty dict if the sheet does not exist.
+    """
+    params_sheet_name = None
+    for s in wb.sheetnames:
+        if s.lower() == "_parameters":
+            params_sheet_name = s
+            break
+
+    if params_sheet_name is None:
+        return {}
+
+    ws = wb[params_sheet_name]
+    if (ws.max_row or 0) < 2:
+        return {}
+
+    hmap: dict[str, int] = {}
+    for c in range(1, (ws.max_column or 1) + 1):
+        name = _clean(ws.cell(1, c).value).lower()
+        if name:
+            hmap[name] = c
+
+    name_col = hmap.get("parameter_name")
+    value_col = hmap.get("parameter_value")
+    if not name_col or not value_col:
+        print(f"  WARNING: _parameters sheet missing required headers (parameter_name, parameter_value)")
+        return {}
+
+    parameters: dict[str, str] = {}
+    for r in range(2, (ws.max_row or 1) + 1):
+        param_name = _clean(ws.cell(r, name_col).value)
+        param_value = _clean(ws.cell(r, value_col).value)
+        if not param_name:
+            continue
+        parameters[param_name.strip().upper()] = param_value
+
+    return parameters
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -723,7 +629,6 @@ def validate_cross_sheet(servers: dict[str, ServerData]) -> list[str]:
         other_types = {tc.name: tc.dtype for tc in other.target_columns}
         other_pks = {tc.name: tc.pk_marker for tc in other.target_columns}
 
-        # X1: Column names
         missing_in_other = ref_cols - other_cols
         extra_in_other = other_cols - ref_cols
         if missing_in_other:
@@ -737,15 +642,13 @@ def validate_cross_sheet(servers: dict[str, ServerData]) -> list[str]:
                 f"{sorted(extra_in_other)}"
             )
 
-        # X2: Data types
         for col in ref_cols & other_cols:
-            if ref_types.get(col, "").upper() != other_types.get(col, "").upper():
+            if (ref_types.get(col, "").upper() != other_types.get(col, "").upper()):
                 errors.append(
                     f"[X2] Column '{col}' dtype mismatch: "
                     f"'{ref_name}'={ref_types[col]} vs '{other_name}'={other_types[col]}"
                 )
 
-        # X3: PK markers
         for col in ref_cols & other_cols:
             r_pk = (ref_pks.get(col) or "").upper()
             o_pk = (other_pks.get(col) or "").upper()
@@ -759,7 +662,7 @@ def validate_cross_sheet(servers: dict[str, ServerData]) -> list[str]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Server Data Serialization
+# Serialization
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _serialize_server(sd: ServerData) -> dict:
@@ -778,12 +681,13 @@ def _serialize_server(sd: ServerData) -> dict:
         "joins": [
             {
                 "sheet_name": j.sheet_name,
-                "left_table": j.left_table,
                 "join_alias": j.join_alias,
                 "join_table": j.join_table,
                 "join_db": j.join_db,
                 "join_schema": j.join_schema,
                 "join_type": j.join_type,
+                "left_key": j.left_key,
+                "right_key": j.right_key,
                 "key_pairs": j.key_pairs,
                 "fetch_columns": j.fetch_columns,
             }
@@ -797,46 +701,75 @@ def _serialize_server(sd: ServerData) -> dict:
 # Top-Level Parser
 # ═══════════════════════════════════════════════════════════════════════════
 
-def parse_excel(excel_path: str | Path) -> dict:
+def parse_excel(
+    excel_path: str | Path,
+    run_syntax_check: bool = True,
+) -> dict:
     """
     Main entry point. Parse an Excel mapping spec and return a dict.
 
-    Runs verify_excel_syntax.verify() first — raises ValueError if verification fails.
+    Parameters
+    ----------
+    excel_path : path to the .xlsx file
+    run_syntax_check : if True, runs verify_excel_syntax.verify() first
+
+    Returns
+    -------
+    dict with keys: file_name, target_db, target_schema, target_table,
+                    target_columns, target_pks,
+                    servers, consistency_errors, parameters
     """
     path = Path(excel_path)
     fname = path.name
 
-    # Run syntax verification before parsing
-    from verify_excel_syntax import verify as verify_syntax
-    print(f"\n  Verifying syntax: {fname}")
-    vresult = verify_syntax(str(path))
-    print(f"  {vresult.summary()}")
-    if not vresult.passed:
-        raise ValueError(
-            f"Excel syntax verification FAILED for '{fname}'. "
-            f"Fix errors above before parsing."
-        )
+    # ── Run syntax verification ──
+    if run_syntax_check:
+        from excel_files.verify_excel_syntax import verify as verify_syntax
+        print(f"  Verifying syntax: {fname}")
+        vresult = verify_syntax(str(path))
+        if not vresult.passed:
+            print(f"  {vresult.summary()}")
+            raise ValueError(
+                f"Excel syntax verification FAILED for '{fname}'. "
+                f"Fix errors above before parsing."
+            )
+        errors = [i for i in vresult.issues if i.severity == "ERROR"]
+        warnings = [i for i in vresult.issues if i.severity == "WARNING"]
+        print(f"  Syntax OK ({len(errors)} errors, {len(warnings)} warnings)")
+    else:
+        print(f"  Skipping syntax verification (run_syntax_check=False)")
 
-    # Extract target_db, target_schema, and target_table from filename
+    # ── Extract target info from filename ──
     m = FILENAME_RE.match(fname)
     if m:
-        target_db = m.group("target_db").upper()
-        target_table_raw = f"{m.group('target_schema')}.{m.group('target_table')}"
+        target_db = m.group("target_db")
+        target_schema = m.group("target_schema")
+        target_table = f"{target_schema}.{m.group('target_table')}"
     else:
-        print(f"  WARNING: filename '{fname}' does not match <db>.<schema>.<table>.xlsx pattern")
-        target_db = ""
-        target_table_raw = path.stem
+        parts = path.stem.split(".")
+        if len(parts) >= 3:
+            target_db = parts[0]
+            target_schema = parts[1]
+            target_table = ".".join(parts[1:])
+        elif len(parts) == 2:
+            target_db = parts[0]
+            target_schema = ""
+            target_table = parts[1]
+        else:
+            target_db = ""
+            target_schema = ""
+            target_table = path.stem
 
     wb = openpyxl.load_workbook(str(path), data_only=True)
 
-    # 1. Discover sheets
+    # ── Discover sheets ──
     server_sheet_names, has_joins = discover_sheets(wb)
     if not server_sheet_names:
         raise ValueError(f"No valid server sheets found in '{fname}'")
 
     print(f"  Server sheets: {server_sheet_names}")
 
-    # 2. Parse _joins sheet
+    # ── Parse _joins sheet ──
     joins_by_sheet: dict[str, list[JoinDef]] = {}
     if has_joins:
         joins_ws_name = next(s for s in wb.sheetnames if s.lower() == JOINS_SHEET)
@@ -844,28 +777,26 @@ def parse_excel(excel_path: str | Path) -> dict:
         joins_by_sheet = parse_joins_sheet(wb[joins_ws_name])
         print(f"  Joins loaded for sheets: {list(joins_by_sheet.keys())}")
 
-    # 3. Parse each server sheet
+    # ── Parse _parameters sheet ──
+    parameters = parse_parameters_sheet(wb)
+    if parameters:
+        print(f"  Parameters: {len(parameters)} parameter(s)")
+
+    # ── Parse each server sheet ──
     servers: dict[str, ServerData] = {}
 
     for sheet_name in server_sheet_names:
         ws = wb[sheet_name]
         print(f"  Parsing sheet '{sheet_name}'...")
 
-        # Detect headers
         hdr = detect_headers(ws)
-
-        # Parse data rows
-        mappings, target_cols, source_tables, last_row, fd_warnings = parse_data_rows(ws, hdr)
+        mappings, target_cols, source_tables = parse_data_rows(ws, hdr)
         print(f"    {len(mappings)} column mappings, {len(source_tables)} source table(s)")
-        if fd_warnings:
-            print(f"    ⚠ {len(fd_warnings)} Field Desc mismatch warning(s)")
 
-        # Parse global transforms
         gt = parse_global_transforms(ws, hdr)
         if gt:
             print(f"    {len(gt)} global transform(s)")
 
-        # Get joins for this sheet
         sheet_joins = joins_by_sheet.get(sheet_name, [])
 
         sd = ServerData(
@@ -876,91 +807,65 @@ def parse_excel(excel_path: str | Path) -> dict:
             global_transforms=gt,
             target_columns=target_cols,
         )
-        sd._field_desc_warnings = fd_warnings  # stash for later
         servers[sheet_name] = sd
 
-    # 4. Cross-sheet validation
+    # ── Cross-sheet validation ──
     consistency_errors = validate_cross_sheet(servers)
-    # 4b. Collect Field Desc mismatch warnings (D13)
-    for srv_name, srv_data in servers.items():
-        for w in getattr(srv_data, '_field_desc_warnings', []):
-            consistency_errors.append(f"[{srv_name}] {w}")
     if consistency_errors:
         print(f"\n  ⚠ Cross-sheet consistency errors:")
         for err in consistency_errors:
             print(f"    {err}")
 
-    # 5. Build unified target schema from first server
+    # ── Build result ──
     first_server = servers[server_sheet_names[0]]
-    target_schema_name = ""
-    target_table_name = ""
-
-    # Try to get schema.table from data rows
-    if first_server.column_mappings:
-        first_mapping = first_server.column_mappings[0]
-        # Look for target schema/table in the headers
-        ws0 = wb[server_sheet_names[0]]
-        hdr0 = detect_headers(ws0)
-        tgt_schema_val = _get_tgt_col(hdr0, ws0, hdr0.header_row + 1, "schema")
-        tgt_table_val = _get_tgt_col(hdr0, ws0, hdr0.header_row + 1, "table")
-        if tgt_schema_val:
-            target_schema_name = tgt_schema_val.upper()
-        if tgt_table_val:
-            target_table_name = tgt_table_val.upper()
-
-    full_target = f"{target_schema_name}.{target_table_name}" if target_schema_name else target_table_name
-
     pks = [tc.name for tc in first_server.target_columns if tc.is_pk]
 
     result = {
         "file_name": fname,
         "target_db": target_db,
-        "target_table": full_target or target_table_raw.upper(),
-        "target_schema": {
-            "schema": target_schema_name,
-            "table": full_target or target_table_raw.upper(),
-            "primary_keys": pks,
-            "columns": [
-                {
-                    "name": tc.name,
-                    "dtype": tc.dtype,
-                    "nullable": tc.nullable,
-                    "is_pk": tc.is_pk,
-                    "pk_marker": tc.pk_marker,
-                    "default_val": tc.default_val,
-                    "null_handling": tc.null_handling,
-                }
-                for tc in first_server.target_columns
-            ],
-        },
+        "target_schema": target_schema,
+        "target_table": target_table,
+        "target_columns": [
+            {
+                "name": tc.name,
+                "dtype": tc.dtype,
+                "nullable": tc.nullable,
+                "is_pk": tc.is_pk,
+                "pk_marker": tc.pk_marker,
+                "default_val": tc.default_val,
+                "force_dtype": tc.force_dtype,
+                "null_handling": tc.null_handling,
+            }
+            for tc in first_server.target_columns
+        ],
+        "target_pks": pks,
         "servers": {
             name: _serialize_server(sd) for name, sd in servers.items()
         },
         "consistency_errors": consistency_errors,
+        "parameters": parameters,
     }
 
+    wb.close()
     return result
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Configuration — edit these variables before running
+# Configuration — edit these variables before running standalone
 # ═══════════════════════════════════════════════════════════════════════════
-
-# Path to the Excel mapping file (must be in same folder or provide full path)
-# Examples: "analytics_dw.dimensional.dim_vehicle_master.xlsx"
-#           "analytics_dw.reporting.fact_commercial.xlsx"
-#           "analytics_dw.reporting.fact_production.xlsx"
 
 # EXCEL_FILE = "analytics_dw.public.dim_vehicle_master.xlsx"
 # EXCEL_FILE = "analytics_dw.public.fact_commercial.xlsx"
 EXCEL_FILE = "analytics_dw.public.fact_production.xlsx"
 
 # Output JSON path (None = auto-generate as <stem>_parsed.json in same folder)
-# Examples: "parsed_output.json", None
 OUTPUT_JSON = None
 
-# Pretty-print the JSON output (True = indented, False = compact)
+# Pretty-print the JSON output
 PRETTY_PRINT = True
+
+# Run syntax verification before parsing
+RUN_SYNTAX_CHECK = True
 
 
 if __name__ == "__main__":
@@ -971,7 +876,7 @@ if __name__ == "__main__":
 
     print(f"\nParsing: {excel_path.name}")
     try:
-        result = parse_excel(excel_path)
+        result = parse_excel(excel_path, run_syntax_check=RUN_SYNTAX_CHECK)
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         sys.exit(1)

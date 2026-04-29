@@ -3,20 +3,22 @@ generate_etl_runbook.py
 ------------------------
 Runbook Generator — Combined Aliased Extract (single CSV per server).
 
-Reads Excel mapping specs (this project's format) and generates:
+Reads Excel mapping specs via excel_schema_parser.py and generates:
   Shared:
     02_create_target_sf.sql
     05_extract_target_sf.sql
+    parameters.json
   Per server:
     source_tables/01_src_*_ddl.sql
     03_extract_source.sql   (combined query, aliased to target names)
     04_transform.py         (single-DF, COPY skipped)
     06_pipeline_log.md
 
-If a parsed JSON file already exists for the Excel file, it is reused.
-Otherwise, the parser (which runs syntax verification first) is invoked.
+Call chain:
+    custom_execution → generate_runbook() → excel_schema_parser.parse_excel()
+                                          → verify_excel_syntax.verify()
 
-Usage:
+Usage (standalone):
     python generate_etl_runbook.py
 """
 
@@ -30,30 +32,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import openpyxl
-
 # ═══════════════════════════════════════════════════════════════════════════
 # Constants
 # ═══════════════════════════════════════════════════════════════════════════
 
-HEADER_NAMES = [
-    "src_db", "src_schema", "src_table", "src_col_name", "src_dtype",
-    "src_nullable", "src_is_pk", "src_is_unique",
-    "transform_type", "transform_rule",
-    "tgt_col_name", "tgt_dtype", "tgt_nullable", "tgt_is_pk",
-    "tgt_default_val", "force_dtype", "null_handling", "notes",
-]
-
-JOINS_HEADERS = [
-    "sheet_name", "join_alias", "join_table", "join_db", "join_schema",
-    "join_type", "left_key", "right_key", "fetch_columns",
-]
-
-SKIP_SHEETS = {"_joins", "_parameters"}
-
-# Global transforms marker and headers
-GT_MARKER = "_global_transforms"
-GT_HEADERS_EXPECTED = {"order", "operation", "parameters", "condition", "notes"}
 
 # Chained replace pattern
 REPLACE_CHAIN_RE = re.compile(
@@ -144,229 +126,80 @@ def _clean(val: Any) -> str:
     return str(val).strip().replace('\xa0', ' ').strip()
 
 
-def _find_header_row(ws) -> int:
-    """Find the row containing column headers (src_db, src_schema, etc.)."""
-    for r in range(1, min(6, (ws.max_row or 1) + 1)):
-        for c in range(1, min((ws.max_column or 1) + 1, 5)):
-            if _clean(ws.cell(r, c).value).lower() == "src_db":
-                return r
-    return -1
-
-
-def _build_header_map(ws, header_row: int) -> dict[str, int]:
-    """Map header name → column index."""
-    hmap = {}
-    for c in range(1, (ws.max_column or 1) + 1):
-        name = _clean(ws.cell(header_row, c).value).lower()
-        if name:
-            hmap[name] = c
-    return hmap
-
-
 # ═══════════════════════════════════════════════════════════════════════════
-# Parameters Sheet Parsing
+# Parser Adapter — convert excel_schema_parser output → generator dataclasses
 # ═══════════════════════════════════════════════════════════════════════════
 
-def parse_parameters_sheet(wb) -> dict[str, str]:
+def _adapt_parsed_result(parsed_dict: dict) -> ParsedExcel:
     """
-    Parse the _parameters sheet from a workbook.
-
-    Returns a dict of {PARAMETER_NAME: parameter_value} for all non-blank rows.
-    Returns empty dict if the sheet does not exist.
+    Convert the dict returned by excel_schema_parser.parse_excel() into
+    the ParsedExcel / ServerData / ColumnMapping dataclasses used by
+    the SQL and transform generators.
     """
-    # Find _parameters sheet (case-insensitive)
-    params_sheet_name = None
-    for s in wb.sheetnames:
-        if s.lower() == "_parameters":
-            params_sheet_name = s
-            break
+    target_columns = []
+    target_pks = parsed_dict.get("target_pks", [])
 
-    if params_sheet_name is None:
-        return {}
+    for tc in parsed_dict.get("target_columns", []):
+        target_columns.append({
+            "name": tc["name"],
+            "dtype": tc["dtype"],
+            "nullable": tc["nullable"],
+            "is_pk": tc["is_pk"],
+            "default_val": tc.get("default_val", ""),
+            "force_dtype": tc.get("force_dtype", ""),
+        })
 
-    ws = wb[params_sheet_name]
-    if (ws.max_row or 0) < 2:
-        return {}
-
-    # Build header map from row 1
-    hmap: dict[str, int] = {}
-    for c in range(1, (ws.max_column or 1) + 1):
-        name = _clean(ws.cell(1, c).value).lower()
-        if name:
-            hmap[name] = c
-
-    name_col = hmap.get("parameter_name")
-    value_col = hmap.get("parameter_value")
-    if not name_col or not value_col:
-        print(f"  WARNING: _parameters sheet missing required headers (parameter_name, parameter_value)")
-        return {}
-
-    parameters: dict[str, str] = {}
-    for r in range(2, (ws.max_row or 1) + 1):
-        param_name = _clean(ws.cell(r, name_col).value)
-        param_value = _clean(ws.cell(r, value_col).value)
-        if not param_name:
-            continue
-        # Store with uppercase key for consistent lookup
-        parameters[param_name.strip().upper()] = param_value
-
-    return parameters
-
-
-def build_parameters_json(parameters: dict[str, str]) -> str:
-    """Serialize parameters dict to a pretty-printed JSON string."""
-    return json.dumps(parameters, indent=2, ensure_ascii=False)
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Parser
-# ═══════════════════════════════════════════════════════════════════════════
-
-def parse_excel(excel_path: str | Path, run_syntax_check: bool = True) -> ParsedExcel:
-    path = Path(excel_path)
-    fname = path.name
-    stem = path.stem  # e.g. "analytics_dw.dimensional.dim_vehicle_master"
-
-    # Run syntax verification before parsing
-    if run_syntax_check:
-        from verify_excel_syntax import verify as verify_syntax
-        print(f"  Verifying syntax: {fname}")
-        vresult = verify_syntax(str(path))
-        if not vresult.passed:
-            print(f"  {vresult.summary()}")
-            raise ValueError(
-                f"Excel syntax verification FAILED for '{fname}'. "
-                f"Fix errors above before generating runbook."
-            )
-        errors = [i for i in vresult.issues if i.severity == "ERROR"]
-        warnings = [i for i in vresult.issues if i.severity == "WARNING"]
-        print(f"  Syntax OK ({len(errors)} errors, {len(warnings)} warnings)")
-    else:
-        print(f"  Skipping syntax verification (run_syntax_check=False)")
-
-    # Parse filename: <target_db>.<target_schema>.<target_table>
-    parts = stem.split(".")
-    if len(parts) >= 3:
-        target_db = parts[0]
-        target_schema = parts[1]
-        target_table = ".".join(parts[1:])  # schema.table
-    elif len(parts) == 2:
-        target_db = parts[0]
-        target_schema = ""
-        target_table = parts[1]
-    else:
-        target_db = ""
-        target_schema = ""
-        target_table = stem
-
-    wb = openpyxl.load_workbook(str(path), data_only=True)
-
-    # Discover server sheets
-    server_sheets = [s for s in wb.sheetnames if s.lower() not in SKIP_SHEETS]
-
-    # Parse _joins
-    joins_by_sheet: dict[str, list[JoinDef]] = {}
-    if "_joins" in [s.lower() for s in wb.sheetnames]:
-        jws_name = next(s for s in wb.sheetnames if s.lower() == "_joins")
-        jws = wb[jws_name]
-        jhmap = _build_header_map(jws, 1)
-        for r in range(2, (jws.max_row or 1) + 1):
-            def _jget(name):
-                idx = jhmap.get(name, 0)
-                return _clean(jws.cell(r, idx).value) if idx else ""
-            sn = _jget("sheet_name")
-            if not sn:
-                continue
-            fetch_raw = _jget("fetch_columns")
-            fetch_cols = [c.strip() for c in fetch_raw.split(",") if c.strip()]
-            jd = JoinDef(
-                sheet_name=sn,
-                join_alias=_jget("join_alias"),
-                join_table=_jget("join_table"),
-                join_db=_jget("join_db"),
-                join_schema=_jget("join_schema"),
-                join_type=_jget("join_type").upper() or "LEFT",
-                left_key=_jget("left_key"),
-                right_key=_jget("right_key"),
-                fetch_columns=fetch_cols,
-            )
-            joins_by_sheet.setdefault(sn, []).append(jd)
-
-    # Parse each server sheet
-    result = ParsedExcel(
-        file_name=fname,
-        target_db=target_db,
-        target_schema=target_schema,
-        target_table=target_table,
-    )
-
-    for sheet_name in server_sheets:
-        ws = wb[sheet_name]
-        header_row = _find_header_row(ws)
-        if header_row < 0:
-            print(f"  WARNING: sheet '{sheet_name}' has no recognized headers, skipping.")
-            continue
-
-        hmap = _build_header_map(ws, header_row)
+    servers: dict[str, ServerData] = {}
+    for srv_name, srv_dict in parsed_dict.get("servers", {}).items():
+        # Convert column_mappings
         mappings: list[ColumnMapping] = []
-        seen_tgt: set[str] = set()
+        for cm_dict in srv_dict.get("column_mappings", []):
+            mappings.append(ColumnMapping(
+                src_db=cm_dict.get("source_database", ""),
+                src_schema=cm_dict.get("source_schema", ""),
+                src_table=cm_dict.get("source_table", ""),
+                src_col_name=cm_dict.get("source_field", ""),
+                src_dtype=cm_dict.get("source_dtype", ""),
+                src_nullable=cm_dict.get("source_nullable", ""),
+                src_is_pk=cm_dict.get("source_is_pk", ""),
+                src_is_unique=cm_dict.get("source_is_unique", ""),
+                transform_type=cm_dict.get("transform_type", "direct"),
+                transform_rule=cm_dict.get("transform_rule", ""),
+                tgt_col_name=cm_dict.get("target_column", ""),
+                tgt_dtype=cm_dict.get("target_dtype", ""),
+                tgt_nullable=cm_dict.get("target_pk_marker", ""),
+                tgt_is_pk=cm_dict.get("target_pk_marker", ""),
+                tgt_default_val=cm_dict.get("target_default_val", ""),
+                force_dtype=cm_dict.get("force_dtype", ""),
+                null_handling=cm_dict.get("null_handling", ""),
+                notes=cm_dict.get("notes", ""),
+            ))
 
-        for r in range(header_row + 1, (ws.max_row or header_row) + 1):
-            def _get(name):
-                idx = hmap.get(name, 0)
-                return _clean(ws.cell(r, idx).value) if idx else ""
+        # Convert joins
+        joins: list[JoinDef] = []
+        for jd_dict in srv_dict.get("joins", []):
+            joins.append(JoinDef(
+                sheet_name=jd_dict.get("sheet_name", ""),
+                join_alias=jd_dict.get("join_alias", ""),
+                join_table=jd_dict.get("join_table", ""),
+                join_db=jd_dict.get("join_db", ""),
+                join_schema=jd_dict.get("join_schema", ""),
+                join_type=jd_dict.get("join_type", "LEFT"),
+                left_key=jd_dict.get("left_key", ""),
+                right_key=jd_dict.get("right_key", ""),
+                fetch_columns=jd_dict.get("fetch_columns", []),
+            ))
 
-            tgt_col = _get("tgt_col_name")
-            transform_type = _get("transform_type")
-            if not tgt_col and not transform_type:
-                # Check if completely blank row
-                if not any(_clean(ws.cell(r, c).value) for c in range(1, min((ws.max_column or 1) + 1, 20))):
-                    continue
-                # Might be a legend row — stop
-                first_cell = _clean(ws.cell(r, 1).value).lower()
-                if first_cell in ("transform type legend", GT_MARKER, ""):
-                    break
-                continue
-
-            if not tgt_col:
-                continue
-
-            cm = ColumnMapping(
-                src_db=_get("src_db"),
-                src_schema=_get("src_schema"),
-                src_table=_get("src_table"),
-                src_col_name=_get("src_col_name"),
-                src_dtype=_get("src_dtype"),
-                src_nullable=_get("src_nullable"),
-                src_is_pk=_get("src_is_pk"),
-                src_is_unique=_get("src_is_unique"),
-                transform_type=transform_type.lower() if transform_type else "direct",
-                transform_rule=_get("transform_rule"),
-                tgt_col_name=tgt_col.upper(),
-                tgt_dtype=_get("tgt_dtype"),
-                tgt_nullable=_get("tgt_nullable"),
-                tgt_is_pk=_get("tgt_is_pk"),
-                tgt_default_val=_get("tgt_default_val"),
-                force_dtype=_get("force_dtype"),
-                null_handling=_get("null_handling"),
-                notes=_get("notes"),
-            )
-            mappings.append(cm)
-
-            # Build target column list (deduplicated)
-            if cm.tgt_col_name not in seen_tgt:
-                seen_tgt.add(cm.tgt_col_name)
-                is_pk = cm.tgt_is_pk and cm.tgt_is_pk.upper() in ("Y", "YES")
-                result.target_columns.append({
-                    "name": cm.tgt_col_name,
-                    "dtype": cm.tgt_dtype,
-                    "nullable": cm.tgt_nullable.upper() not in ("N", "NO") if cm.tgt_nullable else True,
-                    "is_pk": is_pk,
-                    "default_val": cm.tgt_default_val,
-                    "force_dtype": cm.force_dtype,
-                })
-                if is_pk:
-                    result.target_pks.append(cm.tgt_col_name)
+        # Convert global transforms
+        global_transforms: list[GlobalTransform] = []
+        for gt_dict in srv_dict.get("global_transforms", []):
+            global_transforms.append(GlobalTransform(
+                order=gt_dict.get("order", 0),
+                operation=gt_dict.get("operation", ""),
+                parameters=gt_dict.get("parameters", ""),
+                condition=gt_dict.get("condition", ""),
+                notes=gt_dict.get("notes", ""),
+            ))
 
         # Group mappings by source table
         source_tables: dict[str, list[ColumnMapping]] = {}
@@ -374,46 +207,7 @@ def parse_excel(excel_path: str | Path, run_syntax_check: bool = True) -> Parsed
             if cm.src_table:
                 source_tables.setdefault(cm.src_table, []).append(cm)
 
-        # Parse global transforms section
-        global_transforms: list[GlobalTransform] = []
-        for r in range(header_row + 1, (ws.max_row or header_row) + 1):
-            cell_a = _clean(ws.cell(r, 1).value).lower()
-            if cell_a == GT_MARKER:
-                # Next row has sub-headers: order, operation, parameters, condition, notes
-                gt_hdr_row = r + 1
-                if gt_hdr_row > (ws.max_row or 0):
-                    break
-                gt_hdr_map: dict[str, int] = {}
-                for c in range(1, min((ws.max_column or 1) + 1, 15)):
-                    v = _clean(ws.cell(gt_hdr_row, c).value).lower()
-                    if v in GT_HEADERS_EXPECTED:
-                        gt_hdr_map[v] = c
-                if "order" not in gt_hdr_map or "operation" not in gt_hdr_map:
-                    break
-                for gr in range(gt_hdr_row + 1, (ws.max_row or gt_hdr_row) + 1):
-                    order_val = _clean(ws.cell(gr, gt_hdr_map["order"]).value)
-                    op_val = _clean(ws.cell(gr, gt_hdr_map["operation"]).value)
-                    if not order_val and not op_val:
-                        break
-                    try:
-                        order_int = int(order_val)
-                    except (ValueError, TypeError):
-                        break  # Non-numeric order means end of global transforms
-                    params = _clean(ws.cell(gr, gt_hdr_map.get("parameters", 0)).value) if "parameters" in gt_hdr_map else ""
-                    condition = _clean(ws.cell(gr, gt_hdr_map.get("condition", 0)).value) if "condition" in gt_hdr_map else ""
-                    notes = _clean(ws.cell(gr, gt_hdr_map.get("notes", 0)).value) if "notes" in gt_hdr_map else ""
-                    global_transforms.append(GlobalTransform(
-                        order=order_int,
-                        operation=op_val.upper(),
-                        parameters=params,
-                        condition=condition,
-                        notes=notes,
-                    ))
-                if global_transforms:
-                    print(f"    {len(global_transforms)} global transform(s) parsed")
-                break
-
-        # Determine main table (most columns)
+        # Determine main table
         main_table = ""
         main_db = ""
         main_schema = ""
@@ -423,19 +217,42 @@ def parse_excel(excel_path: str | Path, run_syntax_check: bool = True) -> Parsed
             main_db = first_of_main.src_db
             main_schema = first_of_main.src_schema
 
-        sd = ServerData(
-            name=sheet_name,
+        servers[srv_name] = ServerData(
+            name=srv_name,
             mappings=mappings,
-            joins=joins_by_sheet.get(sheet_name, []),
+            joins=joins,
             global_transforms=global_transforms,
             source_tables=source_tables,
             main_table=main_table,
             main_db=main_db,
             main_schema=main_schema,
         )
-        result.servers[sheet_name] = sd
 
-    return result
+    return ParsedExcel(
+        file_name=parsed_dict.get("file_name", ""),
+        target_db=parsed_dict.get("target_db", ""),
+        target_schema=parsed_dict.get("target_schema", ""),
+        target_table=parsed_dict.get("target_table", ""),
+        servers=servers,
+        target_columns=target_columns,
+        target_pks=target_pks,
+    )
+
+
+def parse_excel_via_parser(
+    excel_path: str | Path,
+    run_syntax_check: bool = True,
+) -> tuple[ParsedExcel, dict[str, str]]:
+    """
+    Parse an Excel file using excel_schema_parser and return
+    (ParsedExcel for generators, parameters dict).
+    """
+    from excel_files.excel_schema_parser import parse_excel as _parser_parse_excel
+
+    parsed_dict = _parser_parse_excel(excel_path, run_syntax_check=run_syntax_check)
+    parsed = _adapt_parsed_result(parsed_dict)
+    parameters = parsed_dict.get("parameters", {})
+    return parsed, parameters
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1713,19 +1530,8 @@ def generate_runbook(
     path = Path(excel_path)
     out_base = Path(output_dir)
 
-    # Check if parsed JSON already exists
-    parsed_json_path = path.with_name(path.stem + "_parsed.json")
-    if parsed_json_path.exists():
-        print(f"\n  Found existing parsed JSON: {parsed_json_path.name}")
-        print(f"  Delete it to force re-parse from Excel.")
-
     print(f"\n  Parsing: {path.name}")
-    parsed = parse_excel(path, run_syntax_check=run_syntax_check)
-
-    # Parse _parameters sheet and generate parameters.json
-    wb_params = openpyxl.load_workbook(str(path), data_only=True)
-    parameters = parse_parameters_sheet(wb_params)
-    wb_params.close()
+    parsed, parameters = parse_excel_via_parser(path, run_syntax_check=run_syntax_check)
 
     # Apply partial column filter if requested
     if partial_cols:
@@ -1753,7 +1559,7 @@ def generate_runbook(
     # Parameters JSON (from _parameters sheet)
     if parameters:
         (table_dir / "parameters.json").write_text(
-            build_parameters_json(parameters), encoding="utf-8"
+            json.dumps(parameters, indent=2, ensure_ascii=False), encoding="utf-8"
         )
         print(f"  OK  parameters.json ({len(parameters)} parameter(s))")
     else:
