@@ -72,22 +72,19 @@ def _apply_filter_to_df(df, filter_dict: dict, label: str = "source"):
 # PIPELINE STEPS
 # ============================================================================
 
-def step_1_load_transform_union(spark, ctx: dict, blob_base: str):
+def step_1_load_source(spark, ctx: dict, blob_base: str) -> list:
     """
-    Step 1: Load per-server CSVs → Transform each → Union all.
+    Step 1: Load per-server CSVs from Azure Blob Storage.
 
     For each server in config["servers"]:
       - Load CSV from blob_base/<server_name>/source_raw.csv
       - Load schema from source_raw.schema.json
       - Apply source filter (PK/date)
-      - Transform with server-specific 04_transform.py
-      - Collect transformed DF
 
-    Union all server DFs via unionByName(allowMissingColumns=True).
-    Cache result and return (df, row_count).
+    Returns a list of dicts: [{"server_name": str, "df": DataFrame, "server_cfg": dict}, ...]
     """
     logger.info("=" * 60)
-    logger.info("STEP 1: Load + Transform + Union (per server)")
+    logger.info("STEP 1: Load Source CSVs (per server)")
     logger.info("=" * 60)
 
     servers = ctx["config"]["servers"]
@@ -110,14 +107,48 @@ def step_1_load_transform_union(spark, ctx: dict, blob_base: str):
         # Apply PK / date filters
         source_df = _apply_filter_to_df(source_df, source_filter, label=f"source({server_name})")
 
-        # Transform
+        server_dfs.append({
+            "server_name": server_name,
+            "df": source_df,
+            "server_cfg": server_cfg,
+        })
+
+    logger.info("Step 1 complete: %d server(s) loaded", len(server_dfs))
+    return server_dfs
+
+
+def step_2_transform_union(spark, server_dfs: list, ctx: dict):
+    """
+    Step 2: Transform each per-server DataFrame, then union all.
+
+    For each entry in server_dfs (produced by step_1_load_source):
+      - Transform with server-specific 04_transform.py
+
+    Union all transformed DFs via unionByName(allowMissingColumns=True).
+    Cache result and return (df, row_count).
+    """
+    logger.info("=" * 60)
+    logger.info("STEP 2: Transform + Union (per server)")
+    logger.info("=" * 60)
+
+    transformed_dfs = []
+
+    for entry in server_dfs:
+        server_name = entry["server_name"]
+        source_df = entry["df"]
+        server_cfg = entry["server_cfg"]
+
+        logger.info("─── Transforming server: %s ───", server_name)
+
         transformed_df = perform_transform(
             df=source_df,
             transform_file=server_cfg["transform_file"],
         )
         logger.info("  Transformed: %d columns", len(transformed_df.columns))
-
         transformed_dfs.append(transformed_df)
+
+    if not transformed_dfs:
+        raise ValueError("No server DataFrames to union — step_1_load_source returned empty list")
 
     # Union all server DataFrames
     if len(transformed_dfs) == 1:
@@ -198,7 +229,7 @@ def step_4_extract_target(spark, ctx: dict):
     return target_df, row_count
 
 
-def step_4_compare(spark, transformed_df, target_df, ctx: dict) -> int:
+def step_5_compare(spark, transformed_df, target_df, ctx: dict) -> int:
     """Step 4: Compare source and target DataFrames, produce diff_report.csv only."""
     logger.info("=" * 60)
     logger.info("STEP 4: Compare Data & Generate Report")
