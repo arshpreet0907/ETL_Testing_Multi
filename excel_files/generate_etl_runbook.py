@@ -20,6 +20,14 @@ Call chain:
 
 Usage (standalone):
     python generate_etl_runbook.py
+
+Dialect support:
+    Server name containing 'mysql'  → dialect=mysql  (db.table FQN, no schema layer)
+    All other server names          → dialect=sqlserver (db.schema.table FQN)
+
+Extract SQL approach:
+    Inline subqueries instead of WITH/CTE — compatible with both SQL Server and
+    MySQL when Spark JDBC wraps the query in SELECT * FROM (...) t.
 """
 
 from __future__ import annotations
@@ -103,6 +111,9 @@ class ServerData:
     main_table: str = ""
     main_db: str = ""
     main_schema: str = ""
+    # dialect: inferred from server name — "mysql" | "sqlserver"
+    # Server names containing 'mysql' → mysql, all others → sqlserver
+    dialect: str = "sqlserver"
 
 
 @dataclass
@@ -124,6 +135,13 @@ def _clean(val: Any) -> str:
     if val is None:
         return ""
     return str(val).strip().replace('\xa0', ' ').strip()
+
+
+def _infer_dialect(srv_name: str) -> str:
+    """Infer SQL dialect from server name convention.
+    Server names containing 'mysql' → 'mysql', everything else → 'sqlserver'.
+    """
+    return "mysql" if "mysql" in srv_name.lower() else "sqlserver"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -217,6 +235,9 @@ def _adapt_parsed_result(parsed_dict: dict) -> ParsedExcel:
             main_db = first_of_main.src_db
             main_schema = first_of_main.src_schema
 
+        # Infer dialect from server name convention
+        _dialect = _infer_dialect(srv_name)
+
         servers[srv_name] = ServerData(
             name=srv_name,
             mappings=mappings,
@@ -226,6 +247,7 @@ def _adapt_parsed_result(parsed_dict: dict) -> ParsedExcel:
             main_table=main_table,
             main_db=main_db,
             main_schema=main_schema,
+            dialect=_dialect,
         )
 
     return ParsedExcel(
@@ -259,8 +281,16 @@ def parse_excel_via_parser(
 # Source DDL Generation
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _source_table_fqn(db: str, schema: str, table: str) -> str:
-    parts = [p for p in [db, schema, table] if p]
+def _source_table_fqn(db: str, schema: str, table: str, dialect: str = "sqlserver") -> str:
+    """Build a fully-qualified table name respecting dialect rules.
+
+    SQL Server: db.schema.table  (three-part name)
+    MySQL:      db.table         (no schema layer — MySQL has none)
+    """
+    if dialect.lower() == "mysql":
+        parts = [p for p in [db, table] if p]
+    else:
+        parts = [p for p in [db, schema, table] if p]
     return ".".join(parts)
 
 
@@ -284,6 +314,7 @@ def _null_cast_type(cm: ColumnMapping) -> str:
 
 
 def build_source_ddl(db: str, schema: str, table: str, columns: list[dict]) -> str:
+    # DDL uses the raw three-part FQN for documentation purposes regardless of dialect
     fqn = _source_table_fqn(db, schema, table)
     lines = [
         f"-- ============================================================",
@@ -422,10 +453,19 @@ def build_extract_sql(server: ServerData, parsed: ParsedExcel) -> str:
 
     These aliases are used consistently in SELECT and FROM/JOIN clauses.
     Tables with explicit _joins use those join conditions.
-    Tables without joins use CTE + ROW_NUMBER alignment.
+    Tables without joins use inline subquery + ROW_NUMBER alignment.
+
+    Dialect-aware:
+      - SQL Server: db.schema.table FQN
+      - MySQL:      db.table FQN (no schema layer)
+
+    No WITH/CTE is emitted — inline subqueries are used instead.
+    This ensures compatibility when Spark JDBC wraps the query in
+    SELECT * FROM (...) t, which both SQL Server and MySQL reject for CTEs.
     """
     mappings = server.mappings
     joins = server.joins
+    dialect = server.dialect
 
     # Identify all source tables
     src_tables = list(server.source_tables.keys())
@@ -436,7 +476,9 @@ def build_extract_sql(server: ServerData, parsed: ParsedExcel) -> str:
 
     # Main table always gets 'm'
     table_alias[server.main_table] = "m"
-    table_fqn[server.main_table] = _source_table_fqn(server.main_db, server.main_schema, server.main_table)
+    table_fqn[server.main_table] = _source_table_fqn(
+        server.main_db, server.main_schema, server.main_table, dialect
+    )
 
     # Tables with _joins entries get their join_alias
     join_by_table: dict[str, JoinDef] = {}
@@ -445,7 +487,9 @@ def build_extract_sql(server: ServerData, parsed: ParsedExcel) -> str:
         if jd.join_table not in table_alias:
             table_alias[jd.join_table] = jd.join_alias
             jdb = jd.join_db or server.main_db
-            table_fqn[jd.join_table] = _source_table_fqn(jdb, jd.join_schema, jd.join_table)
+            table_fqn[jd.join_table] = _source_table_fqn(
+                jdb, jd.join_schema, jd.join_table, dialect
+            )
 
     # Remaining mapped tables get auto-aliases (t1, t2, ...)
     auto_idx = 1
@@ -454,7 +498,9 @@ def build_extract_sql(server: ServerData, parsed: ParsedExcel) -> str:
             table_alias[tbl] = f"t{auto_idx}"
             auto_idx += 1
             cms = server.source_tables[tbl]
-            table_fqn[tbl] = _source_table_fqn(cms[0].src_db, cms[0].src_schema, tbl)
+            table_fqn[tbl] = _source_table_fqn(
+                cms[0].src_db, cms[0].src_schema, tbl, dialect
+            )
 
     main_alias = table_alias[server.main_table]
     main_fqn = table_fqn[server.main_table]
@@ -553,10 +599,20 @@ def build_extract_sql(server: ServerData, parsed: ParsedExcel) -> str:
                 already_selected.add(col.lower())
 
     # ── Step 3: Build FROM + JOIN clauses ─────────────────────────────
+    #
+    # Inline subquery approach — no WITH/CTE.
+    #
+    # Why: Both SQL Server and MySQL reject CTEs when Spark JDBC wraps the
+    # query as SELECT * FROM (<your query>) t. Inline subqueries are fully
+    # equivalent and work on both dialects without any runtime rewriting.
+    #
+    # Tables with explicit _joins entries: straight JOIN on the declared key.
+    # Extra tables (no _joins entry): inline subquery with ROW_NUMBER alignment.
+
     from_clause = f"FROM {main_fqn} {main_alias}"
     join_clauses = []
 
-    # Explicit joins from _joins sheet
+    # Explicit joins from _joins sheet — plain table joins, no subquery needed
     for jd in joins:
         a = table_alias[jd.join_table]
         fqn = table_fqn[jd.join_table]
@@ -565,38 +621,37 @@ def build_extract_sql(server: ServerData, parsed: ParsedExcel) -> str:
             f"    ON {main_alias}.{jd.left_key} = {a}.{jd.right_key}"
         )
 
-    # Handle extra tables (no join defined) with CTE + ROW_NUMBER
-    cte_parts = []
-    # Build reverse alias→table map for injecting extra cols into CTEs
-    alias_to_table = {v: k for k, v in table_alias.items()}
     if extra_tables:
-        # Wrap main table in CTE
-        main_cols_in_select = [cm.src_col_name for cm in server.source_tables.get(server.main_table, []) if cm.src_col_name]
-        # Also include join keys from _joins so the JOINs still work inside the CTE
+        # Wrap main table as an inline subquery with ROW_NUMBER
+        main_cols = [
+            cm.src_col_name
+            for cm in server.source_tables.get(server.main_table, [])
+            if cm.src_col_name
+        ]
+        # Include join keys from _joins so explicit JOINs still work
         for jd in joins:
-            if jd.left_key not in main_cols_in_select:
-                main_cols_in_select.append(jd.left_key)
+            if jd.left_key not in main_cols:
+                main_cols.append(jd.left_key)
         # Include extra cols needed by derived transforms for the main table
-        main_old_alias = table_alias[server.main_table]
-        for ecol in extra_src_cols_needed.get(main_old_alias, set()):
-            if ecol not in main_cols_in_select:
-                main_cols_in_select.append(ecol)
+        old_main_alias = main_alias
+        for ecol in extra_src_cols_needed.get(old_main_alias, set()):
+            if ecol not in main_cols:
+                main_cols.append(ecol)
         main_pk = _get_pk_col(server.source_tables.get(server.main_table, []))
-        cte_parts.append(
-            f"cte_main AS (\n"
+
+        main_subquery = (
+            f"(\n"
             f"    SELECT\n"
-            f"        {', '.join(main_cols_in_select)},\n"
+            f"        {', '.join(main_cols)},\n"
             f"        ROW_NUMBER() OVER (ORDER BY {main_pk}) AS rn\n"
             f"    FROM {main_fqn}\n"
-            f")"
+            f") AS cte_main"
         )
-        # Update main alias to point at CTE
-        old_main_alias = main_alias
         main_alias = "cte_main"
         table_alias[server.main_table] = main_alias
-        from_clause = f"FROM cte_main"
+        from_clause = f"FROM {main_subquery}"
 
-        # Re-build explicit join clauses to use new main alias
+        # Rebuild explicit join clauses to use new main alias
         join_clauses = []
         for jd in joins:
             a = table_alias[jd.join_table]
@@ -606,47 +661,41 @@ def build_extract_sql(server: ServerData, parsed: ParsedExcel) -> str:
                 f"    ON {main_alias}.{jd.left_key} = {a}.{jd.right_key}"
             )
 
-        # Add CTE + JOIN for each extra table
+        # Build inline subquery + rn-join for each extra table
         for et in extra_tables:
-            et_alias = table_alias[et]
             et_fqn = table_fqn[et]
-            et_cols = [cm.src_col_name for cm in server.source_tables[et] if cm.src_col_name]
-            # Include extra cols needed by derived transforms for this table
-            et_old_alias = table_alias[et]
-            for ecol in extra_src_cols_needed.get(et_old_alias, set()):
+            et_cols = [
+                cm.src_col_name
+                for cm in server.source_tables[et]
+                if cm.src_col_name
+            ]
+            old_et_alias = table_alias[et]
+            for ecol in extra_src_cols_needed.get(old_et_alias, set()):
                 if ecol not in et_cols:
                     et_cols.append(ecol)
             et_pk = _get_pk_col(server.source_tables.get(et, []))
-            cte_parts.append(
-                f"cte_{et} AS (\n"
+
+            et_subquery = (
+                f"(\n"
                 f"    SELECT\n"
                 f"        {', '.join(et_cols)},\n"
                 f"        ROW_NUMBER() OVER (ORDER BY {et_pk}) AS rn\n"
                 f"    FROM {et_fqn}\n"
-                f")"
+                f") AS cte_{et}"
             )
-            # Override alias to CTE name
             table_alias[et] = f"cte_{et}"
             join_clauses.append(
-                f"JOIN cte_{et} ON {main_alias}.rn = cte_{et}.rn"
+                f"JOIN {et_subquery}\n"
+                f"    ON {main_alias}.rn = cte_{et}.rn"
             )
 
-        # Rebuild SELECT parts with updated aliases
-        # Build a map of old alias → new alias for all changed tables
+        # Remap SELECT parts: old short aliases (m, t1, t2...) → cte_* names
         alias_remap = {old_main_alias: main_alias}
-        for et in extra_tables:
-            # The old alias was assigned earlier (t1, t2, ...)
-            # Find it by checking what index it was
-            old_a = None
-            auto_i = 1
-            for tbl in src_tables:
-                if tbl != server.main_table and tbl not in joined_tables:
-                    if tbl == et:
-                        old_a = f"t{auto_i}"
-                        break
-                    auto_i += 1
-            if old_a:
-                alias_remap[old_a] = f"cte_{et}"
+        auto_i = 1
+        for tbl in src_tables:
+            if tbl != server.main_table and tbl not in joined_tables:
+                alias_remap[f"t{auto_i}"] = f"cte_{tbl}"
+                auto_i += 1
 
         select_parts_new = []
         for sp in select_parts:
@@ -659,39 +708,38 @@ def build_extract_sql(server: ServerData, parsed: ParsedExcel) -> str:
     # ── Step 4: Build full SQL ────────────────────────────────────────
     comment = [
         "-- ============================================================",
-        f"-- EXTRACT SOURCE | server: {server.name}",
+        f"-- EXTRACT SOURCE | server: {server.name} | dialect: {dialect}",
         f"-- Target: {parsed.target_db}.{parsed.target_table}",
         f"-- Generated: {datetime.now():%Y-%m-%d %H:%M}",
         "-- ============================================================",
         f"-- Main table: {table_fqn[server.main_table]} AS {main_alias}",
     ]
-    # List all table aliases
     for tbl in src_tables:
         if tbl != server.main_table:
             a = table_alias[tbl]
             fqn = table_fqn.get(tbl, tbl)
             jd = join_by_table.get(tbl)
             if jd:
-                comment.append(f"-- {jd.join_type} JOIN {fqn} AS {a} ON {main_alias}.{jd.left_key} = {a}.{jd.right_key}")
+                comment.append(
+                    f"-- {jd.join_type} JOIN {fqn} AS {a} "
+                    f"ON {main_alias}.{jd.left_key} = {a}.{jd.right_key}"
+                )
             else:
-                comment.append(f"-- ROW_NUMBER JOIN {fqn} AS {a}")
+                comment.append(f"-- ROW_NUMBER JOIN {fqn} AS {a} (inline subquery)")
     if extra_tables:
-        comment.append(f"-- Extra tables (ROW_NUMBER aligned): {', '.join(extra_tables)}")
+        comment.append(
+            f"-- Extra tables (ROW_NUMBER aligned, inline subquery): {', '.join(extra_tables)}"
+        )
     comment.append("--")
-    comment.append("-- All source tables aliased upfront.")
+    comment.append("-- Inline subquery approach: no WITH/CTE.")
+    comment.append("-- Compatible with SQL Server and MySQL via Spark JDBC.")
     comment.append("-- Columns aliased to target names where possible.")
     comment.append("-- Non-trivial transforms applied in 04_transform.py.")
     comment.append("")
 
     sql_parts = []
-    # Add USE statement for the main database
-    main_db_schema = _source_table_fqn(server.main_db, server.main_schema, "").rstrip(".")
-    if main_db_schema:
-        sql_parts.append(f"use {main_db_schema};")
-    if cte_parts:
-        sql_parts.append("WITH")
-        sql_parts.append(",\n".join(cte_parts))
-
+    # No USE statement — FQNs (db.schema.table or db.table) are baked into
+    # every table reference above, so no context-switch is needed.
     sql_parts.append("SELECT")
     sql_parts.append(",\n".join(select_parts))
     sql_parts.append(from_clause)
@@ -770,13 +818,11 @@ def _spark_expr(rule: str, src_col: str, tgt_col: str) -> str:
     m = re.match(r'^(.+?)\s+if\s+(\w+)\s+is\s+(not\s+)?None\s+else\s+(.+)$', first, re.I)
     if m:
         tv, col, is_not, fv = m.group(1).strip(), m.group(2).strip(), bool(m.group(3)), m.group(4).strip()
-        # 'val' refers to the target column (since SQL aliased it)
         col = tgt_col if col == "val" else col
         cond = f"F.col('{col}').isNotNull()" if is_not else f"F.col('{col}').isNull()"
         return f"F.when({cond}, {_lit_or_col(tv, tgt_col)}).otherwise({_lit_or_col(fv, tgt_col)})"
 
     # Python ternary with compound condition: tv if col and col op cmp else fv
-    # e.g. "1 if actual_arrival_dt and actual_arrival_dt > estimated_arrival_dt else 0"
     m = re.match(r'^(.+?)\s+if\s+(\w+)\s+and\s+(\w+)\s*(==|!=|<=|>=|<|>)\s*(.+?)\s+else\s+(.+)$', first, re.I)
     if m:
         tv, null_col, cmp_col, op, cmp_val, fv = (
@@ -1024,9 +1070,6 @@ def build_transform_py(server: ServerData, parsed: ParsedExcel) -> str:
     nn_cols: list[str] = []
 
     # Build source->target lookup for resolving raw source col names in derived rules.
-    # Keep both table-qualified and name-only views; name-only is only used when unambiguous.
-    # Include direct, rename, cast, AND derived mappings where the src col was
-    # aliased to target in SQL (i.e. src wasn't a NULL placeholder)
     src_to_tgt_by_key: dict[tuple[str, str], str] = {}
     src_to_tgt_by_name: dict[str, set[str]] = {}
     _seen_src_derived: set[tuple[str, str]] = set()
@@ -1037,7 +1080,6 @@ def build_transform_py(server: ServerData, parsed: ParsedExcel) -> str:
             src_to_tgt_by_key[src_key] = cm.tgt_col_name
             src_to_tgt_by_name.setdefault(src_name, set()).add(cm.tgt_col_name)
         elif cm.transform_type == "derived" and cm.src_col_name:
-            # First derived mapping for a table+source col gets aliased in SQL
             if src_key not in src_to_tgt_by_key and src_key not in _seen_src_derived:
                 src_to_tgt_by_key[src_key] = cm.tgt_col_name
                 src_to_tgt_by_name.setdefault(src_name, set()).add(cm.tgt_col_name)
@@ -1072,12 +1114,9 @@ def build_transform_py(server: ServerData, parsed: ParsedExcel) -> str:
             continue
 
         if tt in ("direct", "rename"):
-            # Already aliased in SQL — SKIP
             a(f"    # {tt.upper()}: {src} → {tgt} — already aliased in SQL{cmt}")
-            # Just log, no transform needed
             a("")
 
-            # Handle null_handling
             if nh and nh.lower() not in ("error", ""):
                 if nh.lower() == "fill_zero":
                     a(f"    df = df.fillna({{'{tgt}': 0}})")
@@ -1097,8 +1136,6 @@ def build_transform_py(server: ServerData, parsed: ParsedExcel) -> str:
 
         # Non-trivial transform
         a(f"    # {tt.upper()}: {src} → {tgt}{cmt}")
-        # Resolve any raw source column names in the rule to their target aliases
-        # (V3: DF is target-named, raw src names won't exist as columns)
         resolved_rule = rule
         if rule:
             current_key = _src_key(cm.src_table, src)
@@ -1108,21 +1145,17 @@ def build_transform_py(server: ServerData, parsed: ParsedExcel) -> str:
                 token_l = token.lower()
                 if token_l in reserved_rule_tokens:
                     return token
-                # Prefer table-qualified resolution for this mapping row
                 if current_key in src_to_tgt_by_key and token_l == current_key[1]:
                     return src_to_tgt_by_key[current_key]
-                # Only replace by name when the mapping is unambiguous across all tables
                 candidates = src_to_tgt_by_name.get(token_l, set())
                 if len(candidates) == 1:
                     return next(iter(candidates))
                 return token
 
             resolved_rule = re.sub(r'\b[a-z_][a-z0-9_]*\b', _replace_src_token, resolved_rule, flags=re.I)
-        # src_col used for 'val' substitution — resolve to its target name
         src_as_tgt = src_to_tgt_by_key.get(_src_key(cm.src_table, src), tgt)
         a(f"    df = df.withColumn('{tgt}', {_spark_expr(resolved_rule, src_as_tgt, tgt)})")
 
-        # Null handling
         if nh and nh.lower() not in ("error", ""):
             if nh.lower() == "fill_zero":
                 a(f"    df = df.fillna({{'{tgt}': 0}})")
@@ -1139,7 +1172,7 @@ def build_transform_py(server: ServerData, parsed: ParsedExcel) -> str:
             nn_cols.append(tgt)
         a("")
 
-    # ── Step 3: Global transforms (applied after all column-level transforms) ──
+    # ── Step 3: Global transforms ──────────────────────────────────────
     if server.global_transforms:
         a("    # ═══════════════════════════════════════════════════════════════")
         a("    # GLOBAL TRANSFORMS — applied to filtered column sets in order")
@@ -1155,7 +1188,6 @@ def build_transform_py(server: ServerData, parsed: ParsedExcel) -> str:
 
             a(f"    # Global #{gt.order}: {op} | condition={cond or 'all'}{cmt}")
 
-            # Resolve condition → list of target columns
             if not cond:
                 col_list_expr = f"{tgt_cols!r}"
             elif cond.lower().startswith("dtype:"):
@@ -1292,8 +1324,9 @@ def build_pipeline_log(server: ServerData, parsed: ParsedExcel) -> str:
         "",
         f"> Generated: {datetime.now():%Y-%m-%d %H:%M}",
         f"> Server: `{server.name}`",
+        f"> Dialect: `{server.dialect}`",
         f"> Target: `{tgt}`",
-        f"> Approach: V3 (Combined Aliased Extract)",
+        f"> Approach: V3 (Combined Aliased Extract — inline subqueries)",
         f"> Source tables: {len(server.source_tables)}",
         f"> Joins: {len(server.joins)}",
         "",
@@ -1305,11 +1338,11 @@ def build_pipeline_log(server: ServerData, parsed: ParsedExcel) -> str:
 
     for table_name, cms in server.source_tables.items():
         db = cms[0].src_db
-        lines.append(f"### `{_source_table_fqn(db, cms[0].src_schema, table_name)}`")
+        fqn = _source_table_fqn(db, cms[0].src_schema, table_name, server.dialect)
+        lines.append(f"### `{fqn}`")
         lines.append("")
         lines.append("| Source Column | Type | → Target | Transform | SQL Note |")
         lines.append("|---|---|---|---|---|")
-        # Track src cols already projected to detect shared-source derived cols
         _proj: dict[str, str] = {}
         for cm in cms:
             if cm.transform_type in ("direct", "rename", "cast") and cm.src_col_name:
@@ -1417,7 +1450,7 @@ def _filter_parsed_for_partial(parsed: ParsedExcel, partial_cols: list[str]) -> 
         filtered_mappings = [cm for cm in server.mappings if cm.tgt_col_name in requested]
 
         # Step 2: find extra source cols needed by derived transform rules
-        extra_src_cols: set[str] = set()  # source col names to auto-include
+        extra_src_cols: set[str] = set()
         reserved_tokens = {
             'val', 'if', 'else', 'and', 'or', 'not', 'None', 'True', 'False',
             'UPPER', 'LOWER', 'TRIM', 'ROUND', 'CAST', 'CONCAT', 'COALESCE',
@@ -1430,7 +1463,6 @@ def _filter_parsed_for_partial(parsed: ParsedExcel, partial_cols: list[str]) -> 
                 for ref in refs:
                     if ref in reserved_tokens or ref == cm.src_col_name:
                         continue
-                    # Check if ref is a source col in any source table
                     for tbl_name, tbl_cms in server.source_tables.items():
                         for tcm in tbl_cms:
                             if tcm.src_col_name == ref and tcm.tgt_col_name not in requested:
@@ -1442,7 +1474,6 @@ def _filter_parsed_for_partial(parsed: ParsedExcel, partial_cols: list[str]) -> 
             for cm in server.mappings:
                 if cm.tgt_col_name in extra_src_cols and cm not in filtered_mappings:
                     filtered_mappings.append(cm)
-            # Also add to target columns if not already there
             for col_name in extra_src_cols:
                 if col_name not in requested:
                     requested.add(col_name)
@@ -1466,7 +1497,6 @@ def _filter_parsed_for_partial(parsed: ParsedExcel, partial_cols: list[str]) -> 
                         filtered_source_tables[tbl_name].append(cm)
                         if cm not in filtered_mappings:
                             filtered_mappings.append(cm)
-                        # Ensure target col is included too
                         if cm.tgt_col_name not in requested:
                             requested.add(cm.tgt_col_name)
                             tc = next((c for c in parsed.target_columns if c["name"] == cm.tgt_col_name), None)
@@ -1477,10 +1507,8 @@ def _filter_parsed_for_partial(parsed: ParsedExcel, partial_cols: list[str]) -> 
         filtered_tgt_set = {cm.tgt_col_name for cm in filtered_mappings}
         filtered_joins = []
         for jd in server.joins:
-            # Check if any fetch_column is used by a filtered mapping
             if any(fc in filtered_tgt_set for fc in jd.fetch_columns):
                 filtered_joins.append(jd)
-            # Also keep if the join table has mappings in filtered set
             elif jd.join_table in filtered_source_tables:
                 filtered_joins.append(jd)
 
@@ -1498,14 +1526,14 @@ def _filter_parsed_for_partial(parsed: ParsedExcel, partial_cols: list[str]) -> 
             name=server.name,
             mappings=filtered_mappings,
             joins=filtered_joins,
-            global_transforms=server.global_transforms,  # keep as-is (apply conditionally at runtime)
+            global_transforms=server.global_transforms,
             source_tables=filtered_source_tables,
             main_table=main_table,
             main_db=main_db,
             main_schema=main_schema,
+            dialect=server.dialect,   # preserve dialect from original server
         )
 
-    # Rebuild ParsedExcel
     return ParsedExcel(
         file_name=parsed.file_name,
         target_db=parsed.target_db,
@@ -1600,15 +1628,15 @@ def generate_runbook(
 # Edit these variables before running:
 EXCEL_FILES = [
     "analytics_dw.public.dim_vehicle_master.xlsx",
-    "analytics_dw.public.fact_commercial.xlsx",
-    "analytics_dw.public.fact_production.xlsx",
+    # "analytics_dw.public.fact_commercial.xlsx",
+    # "analytics_dw.public.fact_production.xlsx",
 ]
 OUTPUT_DIR = "etl_output"
 
 # Set to a list of target column names for partial extraction.
 # Example: ["VIN", "MODEL_YEAR", "PLANT_CODE"]
 # Set to None or [] for full table extraction (default).
-PARTIAL_TARGET_COLS: list[str] | None = None#["MODEL_NAME","ENGINE_TYPE","PART_STOCK_QTY","CONTACT_DEPARTMENT"]
+PARTIAL_TARGET_COLS: list[str] | None = None  # ["MODEL_NAME","ENGINE_TYPE","PART_STOCK_QTY","CONTACT_DEPARTMENT"]
 
 # Set to False to skip syntax verification before parsing.
 # Useful when re-running with different partial_cols on an already-verified Excel.
@@ -1634,8 +1662,3 @@ if __name__ == "__main__":
             print(f"  ERROR: {p.name}: {e}")
             import traceback
             traceback.print_exc()
-
-
-
-
-

@@ -25,7 +25,7 @@ _log = logging.getLogger("etl_pipeline")
 
 # ── Widget definitions (Databricks Job config / manual overrides) ──
 # These serve as fallback when a parameter is absent from the Excel sheet.
-dbutils.widgets.text("TABLE_NAME",          "public_dim_vehicle_master")
+dbutils.widgets.text("TABLE_NAME",          "")  # optional override; derived from EXCEL_FILE if blank
 dbutils.widgets.text("SUB_PATH",            "xl")
 dbutils.widgets.text("STORAGE_ACCOUNT",     "etlstorage0907")
 dbutils.widgets.text("CONTAINER",           "etl-source-data")
@@ -84,8 +84,12 @@ def _get_param(name: str, params_json: dict, *, required: bool = True,
 #           generator, which will write parameters.json)
 # ──────────────────────────────────────────────────────────────────
 EXCEL_FILE       = dbutils.widgets.get("EXCEL_FILE")
-TABLE_NAME       = dbutils.widgets.get("TABLE_NAME")        # used to locate output folder
 RUN_SYNTAX_CHECK = dbutils.widgets.get("RUN_SYNTAX_CHECK").lower() == "true"
+
+# Derive TABLE_NAME from excel filename (e.g. analytics_dw.public.dim_vehicle_master.xlsx → public_dim_vehicle_master)
+_excel_stem      = os.path.splitext(EXCEL_FILE)[0]           # analytics_dw.public.dim_vehicle_master
+_derived_table   = "_".join(_excel_stem.split(".")[1:])      # public_dim_vehicle_master
+TABLE_NAME       = dbutils.widgets.get("TABLE_NAME").strip() or _derived_table
 
 # PARTIAL_COLS for runbook generation: widget is the bootstrap source.
 # After parameters.json is written it will also hold the Excel value
@@ -134,7 +138,7 @@ else:
 
 # All variables resolved here; widgets act as fallback for anything not
 # present in the Excel _parameters sheet.
-TABLE_NAME          = _get_param("TABLE_NAME",          _PARAMS_JSON)
+TABLE_NAME          = _get_param("TABLE_NAME", _PARAMS_JSON, required=False) or _derived_table
 SUB_PATH            = _get_param("SUB_PATH",            _PARAMS_JSON)
 STORAGE_ACCOUNT     = _get_param("STORAGE_ACCOUNT",     _PARAMS_JSON)
 CONTAINER           = _get_param("CONTAINER",           _PARAMS_JSON)
