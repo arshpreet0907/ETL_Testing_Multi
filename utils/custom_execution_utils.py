@@ -252,7 +252,7 @@ def step_5_compare(spark, transformed_df, target_df, ctx: dict) -> int:
         compare_cols = sorted(common_lower - pk_lower - exc_lower - {"_source_server"})
         logger.info("Auto-detected compare columns: %s", compare_cols)
 
-    qualified_table_name = ctx["config"].get("qualified_table_name")
+
 
     exit_code = compare_and_report(
         spark=spark,
@@ -261,7 +261,7 @@ def step_5_compare(spark, transformed_df, target_df, ctx: dict) -> int:
         primary_key_cols=ctx["primary_keys"],
         compare_cols=compare_cols,
         output_path=ctx["report_csv"],
-        qualified_table_name=qualified_table_name,
+
     )
 
     logger.info("Step 5 complete.")
