@@ -89,6 +89,7 @@ _TGT_PREFIX = "tgt_"
 # Reusable diff output schema
 _DIFF_SCHEMA = StructType([
     StructField("primary_key_value", StringType(), True),
+    StructField("source_server",     StringType(), True),
     StructField("column_name",        StringType(), True),
     StructField("expected_value",     StringType(), True),
     StructField("actual_value",       StringType(), True),
@@ -263,7 +264,14 @@ def compare_dataframes(
         source_df.schema, target_df.schema, compare_cols,
     )
 
-    source_norm = _normalise_df(source_df, all_cols, precision_map)
+    # Preserve _source_server if present (for multi-source traceability)
+    has_source_server = "_source_server" in [c.lower() for c in source_df.columns]
+    if has_source_server:
+        all_cols_with_meta = all_cols + ["_source_server"]
+        source_norm = _normalise_df(source_df, all_cols_with_meta, precision_map)
+    else:
+        source_norm = _normalise_df(source_df, all_cols, precision_map)
+    
     target_norm = _normalise_df(target_df, all_cols, precision_map)
 
     source_norm = source_norm.cache()
@@ -788,14 +796,16 @@ def _phase2_collected(
         missing_rows = slim_joined.filter(
             in_src_expr & ~in_tgt_expr
         ).select(
-            *[F.col(f"{_SRC_PREFIX}{pk}").alias(pk) for pk in pk_cols]
+            *[F.col(f"{_SRC_PREFIX}{pk}").alias(pk) for pk in pk_cols],
+            F.col("_source_server") if "_source_server" in slim_joined.columns else F.lit(None).alias("_source_server")
         ).collect()
         for row in missing_rows:
             pk_val = "|".join(
                 str(row[pk]) if row[pk] is not None else "" for pk in pk_cols
             )
+            src_server = row.get("_source_server") or "UNKNOWN"
             diffs.append((
-                pk_val, "<ENTIRE_ROW>",
+                pk_val, src_server, "<ENTIRE_ROW>",
                 "<PRESENT_IN_SOURCE>", "<MISSING_IN_TARGET>",
                 "MISSING_IN_TARGET",
             ))
@@ -812,7 +822,7 @@ def _phase2_collected(
                 str(row[pk]) if row[pk] is not None else "" for pk in pk_cols
             )
             diffs.append((
-                pk_val, "<ENTIRE_ROW>",
+                pk_val, "N/A", "<ENTIRE_ROW>",
                 "<EXTRA_IN_TARGET>", "<PRESENT_IN_TARGET>",
                 "EXTRA_IN_TARGET",
             ))
@@ -820,11 +830,14 @@ def _phase2_collected(
     # ── Value mismatches (collect from cache + Python compare) ────────
     if hash_mismatch_count > 0:
         # Step 1: collect mismatched PK values from slim_joined (cached)
+        mismatch_select = [F.col(f"{_SRC_PREFIX}{pk}").alias(pk) for pk in pk_cols]
+        if "_source_server" in slim_joined.columns:
+            mismatch_select.append(F.col("_source_server"))
+        
         mismatch_pk_rows = slim_joined.filter(
             in_both_expr & hash_mismatch_expr
-        ).select(
-            *[F.col(f"{_SRC_PREFIX}{pk}").alias(pk) for pk in pk_cols]
-        ).collect()
+        ).select(*mismatch_select).collect()
+        
         logger.info(
             "Collected %d mismatched PK values for driver-side comparison",
             len(mismatch_pk_rows),
@@ -836,13 +849,16 @@ def _phase2_collected(
         # Broadcast join lets Spark use BroadcastHashJoin, which is proportional
         # to the mismatch count rather than the full dataset size.
         all_cols = pk_cols + compare_cols
+        has_source_server = "_source_server" in source_norm.columns
+        
         if len(pk_cols) == 1:
             pk = pk_cols[0]
             pk_values = [row[pk] for row in mismatch_pk_rows]
             pk_df = spark.createDataFrame([(v,) for v in pk_values], [pk])
+            src_select = all_cols + (["_source_server"] if has_source_server else [])
             src_rows = source_norm.join(
                 F.broadcast(pk_df), on=pk, how="inner"
-            ).select(*all_cols).collect()
+            ).select(*src_select).collect()
             tgt_rows = target_norm.join(
                 F.broadcast(pk_df), on=pk, how="inner"
             ).select(*all_cols).collect()
@@ -853,9 +869,10 @@ def _phase2_collected(
                 for row in mismatch_pk_rows
             ]
             pk_df = spark.createDataFrame(pk_data)
+            src_select = all_cols + (["_source_server"] if has_source_server else [])
             src_rows = source_norm.join(
                 F.broadcast(pk_df), on=pk_cols, how="inner"
-            ).select(*all_cols).collect()
+            ).select(*src_select).collect()
             tgt_rows = target_norm.join(
                 F.broadcast(pk_df), on=pk_cols, how="inner"
             ).select(*all_cols).collect()
@@ -875,6 +892,7 @@ def _phase2_collected(
             tgt_data = tgt_dict.get(pk_str)
             if tgt_data is None:
                 continue  # should not happen for value mismatches
+            src_server = src_data.get("_source_server", "UNKNOWN")
             for col in compare_cols:
                 sv = src_data.get(col)
                 tv = tgt_data.get(col)
@@ -882,7 +900,7 @@ def _phase2_collected(
                 if sv is None and tv is None:
                     continue
                 if sv != tv:
-                    diffs.append((pk_str, col, sv, tv, "VALUE_MISMATCH"))
+                    diffs.append((pk_str, src_server, col, sv, tv, "VALUE_MISMATCH"))
 
     # ── Create diff DataFrame from Python results ─────────────────────
     logger.info("Driver-side comparison produced %d diff rows", len(diffs))
@@ -901,10 +919,14 @@ def _phase2_collected(
 def _prefix_df(df: DataFrame, prefix: str, cols: List[str]) -> DataFrame:
     """
     Select *cols* from *df* and rename each with *prefix*.
+    Preserves _source_server column if present (without prefix).
 
     Example: _prefix_df(df, "src_", ["pk", "col1"]) → columns: src_pk, src_col1
     """
-    return df.select([F.col(c).alias(f"{prefix}{c}") for c in cols])
+    prefixed = [F.col(c).alias(f"{prefix}{c}") for c in cols]
+    if "_source_server" in df.columns and "_source_server" not in cols:
+        prefixed.append(F.col("_source_server"))
+    return df.select(prefixed)
 
 
 def _empty_diff_df() -> DataFrame:

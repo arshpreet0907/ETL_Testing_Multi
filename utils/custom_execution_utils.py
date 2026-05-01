@@ -123,10 +123,13 @@ def step_2_transform_union(spark, server_dfs: list, ctx: dict):
 
     For each entry in server_dfs (produced by step_1_load_source):
       - Transform with server-specific 04_transform.py
+      - Add _source_server column for traceability
 
     Union all transformed DFs via unionByName(allowMissingColumns=True).
     Cache result and return (df, row_count).
     """
+    from pyspark.sql import functions as F
+    
     logger.info("=" * 60)
     logger.info("STEP 2: Transform + Union (per server)")
     logger.info("=" * 60)
@@ -144,7 +147,9 @@ def step_2_transform_union(spark, server_dfs: list, ctx: dict):
             df=source_df,
             transform_file=server_cfg["transform_file"],
         )
-        logger.info("  Transformed: %d columns", len(transformed_df.columns))
+        # Add source server identifier for traceability in diff reports
+        transformed_df = transformed_df.withColumn("_source_server", F.lit(server_name))
+        logger.info("  Transformed: %d columns (+ _source_server)", len(transformed_df.columns) - 1)
         transformed_dfs.append(transformed_df)
 
     if not transformed_dfs:
@@ -243,7 +248,8 @@ def step_5_compare(spark, transformed_df, target_df, ctx: dict) -> int:
         common_lower = src_cols_lower & tgt_cols_lower
         pk_lower = {pk.lower() for pk in ctx["primary_keys"]}
         exc_lower = {e.lower() for e in (ctx["exclude_cols"] or [])}
-        compare_cols = sorted(common_lower - pk_lower - exc_lower)
+        # Exclude _source_server from comparison columns (it's metadata)
+        compare_cols = sorted(common_lower - pk_lower - exc_lower - {"_source_server"})
         logger.info("Auto-detected compare columns: %s", compare_cols)
 
     qualified_table_name = ctx["config"].get("qualified_table_name")

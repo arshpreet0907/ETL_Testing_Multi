@@ -44,6 +44,7 @@ EXIT_CODE_OK = 0
 # Schema columns the diff_df must contain
 REQUIRED_DIFF_COLUMNS = {
     "primary_key_value",
+    "source_server",
     "column_name",
     "expected_value",
     "actual_value",
@@ -105,7 +106,7 @@ def generate_report(
     if qualified_table_name:
         diff_df = diff_df.withColumn("table_name", F.lit(qualified_table_name))
         diff_df = diff_df.select(
-            "table_name", "primary_key_value", "column_name",
+            "table_name", "primary_key_value", "source_server", "column_name",
             "expected_value", "actual_value", "diff_type"
         )
 
@@ -154,7 +155,7 @@ def generate_report(
     # Collects only the 3 lightweight columns needed for summary stats.   #
     # ------------------------------------------------------------------ #
     summary_rows = (
-        diff_df.select("primary_key_value", "diff_type", "column_name")
+        diff_df.select("primary_key_value", "source_server", "diff_type", "column_name")
         .collect()
     )
 
