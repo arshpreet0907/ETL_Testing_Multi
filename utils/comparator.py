@@ -1150,16 +1150,25 @@ def _explode_missing_records(
 
     # Create single row per missing/extra record instead of one per column
     if diff_type == "MISSING_IN_TARGET":
+        # _source_server is available on source-side rows — carry it through
+        src_server_col = (
+            F.col("_source_server")
+            if "_source_server" in df.columns
+            else F.lit(None).cast(StringType())
+        )
         result = df.select(
             pk_concat.alias("primary_key_value"),
+            src_server_col.alias("source_server"),
             F.lit("<ENTIRE_ROW>").alias("column_name"),
             F.lit("<PRESENT_IN_SOURCE>").alias("expected_value"),
             F.lit("<MISSING_IN_TARGET>").alias("actual_value"),
             F.lit(diff_type).alias("diff_type"),
         )
     else:  # EXTRA_IN_TARGET
+        # Target-only rows have no source server — emit null
         result = df.select(
             pk_concat.alias("primary_key_value"),
+            F.lit(None).cast(StringType()).alias("source_server"),
             F.lit("<ENTIRE_ROW>").alias("column_name"),
             F.lit("<EXTRA_IN_TARGET>").alias("expected_value"),
             F.lit("<PRESENT_IN_TARGET>").alias("actual_value"),

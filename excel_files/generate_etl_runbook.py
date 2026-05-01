@@ -227,11 +227,22 @@ def _adapt_parsed_result(parsed_dict: dict) -> ParsedExcel:
                 source_tables.setdefault(cm.src_table, []).append(cm)
 
         # Determine main table
+        # Prefer the table that owns the column mapping to a target PK column.
+        # This ensures the driving table in the FROM clause is always the one
+        # whose PK becomes the target PK — making ROW_NUMBER() ORDER BY stable
+        # and deletion-safe on the driving table.
+        # Fallback: table with the most mapped columns (original heuristic).
         main_table = ""
         main_db = ""
         main_schema = ""
         if source_tables:
-            main_table = max(source_tables, key=lambda k: len(source_tables[k]))
+            pk_owner = None
+            for cm in mappings:
+                if cm.src_table and cm.tgt_is_pk and cm.tgt_is_pk.strip().upper() in ("Y", "YES", "PK"):
+                    pk_owner = cm.src_table
+                    break
+            main_table = pk_owner if pk_owner and pk_owner in source_tables \
+                else max(source_tables, key=lambda k: len(source_tables[k]))
             first_of_main = source_tables[main_table][0]
             main_db = first_of_main.src_db
             main_schema = first_of_main.src_schema
@@ -1633,9 +1644,9 @@ def generate_runbook(
 
 # Edit these variables before running:
 EXCEL_FILES = [
-    # "analytics_dw.public.dim_vehicle_master.xlsx",
+    "analytics_dw.public.dim_vehicle_master.xlsx",
     # "analytics_dw.public.fact_commercial.xlsx",
-    "analytics_dw.public.fact_production.xlsx",
+    # "analytics_dw.public.fact_production.xlsx",
 ]
 OUTPUT_DIR = "etl_output"
 
