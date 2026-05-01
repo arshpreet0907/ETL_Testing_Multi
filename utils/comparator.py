@@ -999,25 +999,41 @@ def _normalise_df(df: DataFrame, cols: List[str], precision_map: dict = None) ->
                     .otherwise(F.col(col).cast("long").cast(StringType()))
                     .alias(col)
                 )
-            elif scale is not None:
+            elif scale is not None and scale > 0:
                 # Float / double / decimal with auto-detected precision →
                 # round to *scale* decimal places before string cast.
                 # This eliminates IEEE-754 noise like 128129.02000000002.
                 # Use format_string to preserve trailing zeros (e.g. "10986.00"
                 # not "10986.0") so source CSV strings match target numerics.
                 fmt = f"%.{scale}f"
+                stripped = F.regexp_replace(
+                    F.format_string(fmt, F.round(F.col(col).cast("double"), scale)),
+                    r"(\d+\.\d*?)0+$", r"$1"
+                )
+                stripped = F.regexp_replace(stripped, r"\.$", "")
                 norm_exprs.append(
                     F.when(F.col(col).isNull(), F.lit(None).cast(StringType()))
-                    .otherwise(
-                        F.format_string(fmt, F.round(F.col(col).cast("double"), scale))
-                    )
+                    .otherwise(stripped)
+                    .alias(col)
+                )
+            elif scale == 0:
+                # DecimalType with scale=0 — treat as integer, no decimal formatting
+                norm_exprs.append(
+                    F.when(F.col(col).isNull(), F.lit(None).cast(StringType()))
+                    .otherwise(F.col(col).cast("long").cast(StringType()))
                     .alias(col)
                 )
             else:
-                # Float/double without precision entry → cast via double
+                # Float/double without precision entry → use default precision
+                fmt = f"%.{_DEFAULT_DOUBLE_PRECISION}f"
+                stripped = F.regexp_replace(
+                    F.format_string(fmt, F.round(F.col(col).cast("double"), _DEFAULT_DOUBLE_PRECISION)),
+                    r"(\d+\.\d*?)0+$", r"$1"
+                )
+                stripped = F.regexp_replace(stripped, r"\.$", "")
                 norm_exprs.append(
                     F.when(F.col(col).isNull(), F.lit(None).cast(StringType()))
-                    .otherwise(F.col(col).cast("double").cast(StringType()))
+                    .otherwise(stripped)
                     .alias(col)
                 )
         else:
