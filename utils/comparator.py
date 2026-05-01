@@ -803,7 +803,8 @@ def _phase2_collected(
             pk_val = "|".join(
                 str(row[pk]) if row[pk] is not None else "" for pk in pk_cols
             )
-            src_server = row.get("_source_server") or "UNKNOWN"
+            row_dict = row.asDict()
+            src_server = row_dict.get("_source_server") or "UNKNOWN"
             diffs.append((
                 pk_val, src_server, "<ENTIRE_ROW>",
                 "<PRESENT_IN_SOURCE>", "<MISSING_IN_TARGET>",
@@ -892,7 +893,7 @@ def _phase2_collected(
             tgt_data = tgt_dict.get(pk_str)
             if tgt_data is None:
                 continue  # should not happen for value mismatches
-            src_server = src_data.get("_source_server", "UNKNOWN")
+            src_server = src_data.get("_source_server") or "UNKNOWN"
             for col in compare_cols:
                 sv = src_data.get(col)
                 tv = tgt_data.get(col)
