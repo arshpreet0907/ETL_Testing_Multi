@@ -59,6 +59,7 @@ def generate_report(
     total_diff_count: int,
     output_path: str,
     exit_on_differences: bool = False,
+    qualified_table_name: str = None,
 ) -> int:
     """
     Persist the diff DataFrame to CSV and print a summary to stdout.
@@ -84,6 +85,9 @@ def generate_report(
         If True, call sys.exit(EXIT_CODE_DIFFERENCES) when differences exist,
         or sys.exit(EXIT_CODE_OK) when there are none.
         Set to False (default) to simply return the exit code to the caller.
+    qualified_table_name : str, optional
+        Fully qualified table name (db.schema.table) to prepend as first column.
+        If None, no table_name column is added.
 
     Returns
     -------
@@ -96,6 +100,14 @@ def generate_report(
         If diff_df is missing any required column.
     """
     _validate_diff_schema(diff_df)
+
+    # Prepend table_name column if provided
+    if qualified_table_name:
+        diff_df = diff_df.withColumn("table_name", F.lit(qualified_table_name))
+        diff_df = diff_df.select(
+            "table_name", "primary_key_value", "column_name",
+            "expected_value", "actual_value", "diff_type"
+        )
 
     # ------------------------------------------------------------------ #
     # Quick check if diff is empty (avoid expensive operations)          #

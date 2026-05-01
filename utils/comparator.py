@@ -925,6 +925,7 @@ def _normalise_df(df: DataFrame, cols: List[str], precision_map: dict = None) ->
       - Normalize numeric columns based on schema type (5.2 == 5.20)
       - Round float/double columns to auto-detected precision to eliminate
         IEEE-754 representation noise (e.g. 128129.02 vs 128129.02000000002)
+      - Strip trailing zeros from string columns that map to numeric on the other side
       - Lowercase boolean literals (true/false)
 
     Numeric normalization is only applied to columns with numeric schema types
@@ -1020,17 +1021,41 @@ def _normalise_df(df: DataFrame, cols: List[str], precision_map: dict = None) ->
                     .alias(col)
                 )
         else:
-            norm_exprs.append(
-                F.when(F.col(col).isNull(), F.lit(None).cast(StringType()))
-                .otherwise(
-                    F.regexp_replace(
-                        F.trim(F.col(col).cast(StringType())),
-                        r"(?i)^(true|false)$",
-                        F.lower(F.col(col).cast(StringType())),
-                    )
+            # String column — check if it maps to a numeric on the other side
+            scale = precision_map.get(col)
+            if scale is not None:
+                # This string column corresponds to a numeric on the other DF.
+                # Strip trailing zeros: "18.60" → "18.6", "18.00" → "18.0"
+                # Then strip trailing dot: "18." → "18"
+                stripped = F.regexp_replace(
+                    F.trim(F.col(col).cast(StringType())),
+                    r"(\d+\.\d*?)0+$", r"$1"  # "18.60" → "18.6", "18.00" → "18."
                 )
-                .alias(col)
-            )
+                stripped = F.regexp_replace(stripped, r"\.$", "")  # "18." → "18"
+                # Also normalize boolean literals
+                stripped = F.regexp_replace(
+                    stripped,
+                    r"(?i)^(true|false)$",
+                    F.lower(stripped),
+                )
+                norm_exprs.append(
+                    F.when(F.col(col).isNull(), F.lit(None).cast(StringType()))
+                    .otherwise(stripped)
+                    .alias(col)
+                )
+            else:
+                # Pure string column — trim + boolean normalize
+                norm_exprs.append(
+                    F.when(F.col(col).isNull(), F.lit(None).cast(StringType()))
+                    .otherwise(
+                        F.regexp_replace(
+                            F.trim(F.col(col).cast(StringType())),
+                            r"(?i)^(true|false)$",
+                            F.lower(F.col(col).cast(StringType())),
+                        )
+                    )
+                    .alias(col)
+                )
     return df.select(*passthrough, *norm_exprs)
 
 

@@ -90,7 +90,7 @@ CLEAN_OUTPUT = dbutils.widgets.get("CLEAN_OUTPUT").lower() == "true"
 # Derive TABLE_NAME from excel filename (e.g. analytics_dw.public.dim_vehicle_master.xlsx → public_dim_vehicle_master)
 _excel_stem      = os.path.splitext(EXCEL_FILE)[0]           # analytics_dw.public.dim_vehicle_master
 _derived_table   = "_".join(_excel_stem.split(".")[1:])      # public_dim_vehicle_master
-TABLE_NAME       = dbutils.widgets.get("TABLE_NAME").strip() or _derived_table
+TABLE_NAME       = _derived_table or dbutils.widgets.get("TABLE_NAME").strip()
 
 # PARTIAL_COLS for runbook generation: widget is the bootstrap source.
 # After parameters.json is written it will also hold the Excel value

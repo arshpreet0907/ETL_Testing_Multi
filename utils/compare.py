@@ -25,9 +25,15 @@ def compare_and_report(
     primary_key_cols: list,
     compare_cols: list,
     output_path: str,
+    qualified_table_name: str = None,
 ) -> int:
     """
     Compare two DataFrames and generate a diff report.
+
+    Parameters
+    ----------
+    qualified_table_name : str, optional
+        Fully qualified table name (db.schema.table) to prepend as first column.
 
     Returns
     -------
@@ -54,6 +60,7 @@ def compare_and_report(
         total_diff_count=total_diffs,
         output_path=output_path,
         exit_on_differences=False,
+        qualified_table_name=qualified_table_name,
     )
     logger.info("Report generation completed in %.2fs", time.time() - start)
 

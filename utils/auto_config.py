@@ -88,7 +88,7 @@ def get_table_config(
     primary_keys = _parse_primary_keys_from_target_ddl(target_ddl)
 
     # Parse target table name from DDL
-    target_db, target_tbl = _parse_ddl_table_name(target_ddl)
+    target_db, target_schema, target_tbl = _parse_ddl_table_name(target_ddl)
 
     # Build per-server configs
     servers = []
@@ -106,12 +106,18 @@ def get_table_config(
             "transform_file": transform_file,
         })
 
+    # Build qualified table name: db.schema.table (skip schema if None)
+    qualified_parts = [p for p in [target_db, target_schema, target_tbl] if p]
+    qualified_table_name = ".".join(qualified_parts) if qualified_parts else target_tbl
+
     return {
         "table_name": table_name,
         "target_ddl": target_ddl,
         "target_query_file": target_query_file,
         "target_database": target_db,
+        "target_schema": target_schema,
         "target_table": target_tbl,
+        "qualified_table_name": qualified_table_name,
         "primary_keys": primary_keys,
         "exclude_cols": ["load_ts", "batch_id"],
         "servers": servers,
@@ -170,7 +176,12 @@ def _parse_primary_keys_from_target_ddl(ddl_file: str) -> List[str]:
 
 
 def _parse_ddl_table_name(ddl_file: str) -> tuple:
-    """Extract database and table name from DDL file."""
+    """Extract database, schema, and table name from DDL file.
+    
+    Returns
+    -------
+    tuple: (database, schema, table) where any component can be None
+    """
     with open(ddl_file, "r", encoding="utf-8") as fh:
         content = fh.read()
 
@@ -180,15 +191,15 @@ def _parse_ddl_table_name(ddl_file: str) -> tuple:
         content, re.IGNORECASE,
     )
     if match:
-        return match.group(1), match.group(3)
+        return match.group(1), match.group(2), match.group(3)
 
-    # db.table
+    # db.table (no schema)
     match = re.search(
         r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)\.(\w+)",
         content, re.IGNORECASE,
     )
     if match:
-        return match.group(1), match.group(2)
+        return match.group(1), None, match.group(2)
 
     # just table
     match = re.search(
@@ -196,7 +207,7 @@ def _parse_ddl_table_name(ddl_file: str) -> tuple:
         content, re.IGNORECASE,
     )
     if match:
-        return None, match.group(1)
+        return None, None, match.group(1)
 
     raise ValueError(f"Could not parse table name from DDL file: {ddl_file}")
 

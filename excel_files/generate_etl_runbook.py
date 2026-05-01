@@ -1633,9 +1633,9 @@ def generate_runbook(
 
 # Edit these variables before running:
 EXCEL_FILES = [
-    "analytics_dw.public.dim_vehicle_master.xlsx",
+    # "analytics_dw.public.dim_vehicle_master.xlsx",
     # "analytics_dw.public.fact_commercial.xlsx",
-    # "analytics_dw.public.fact_production.xlsx",
+    "analytics_dw.public.fact_production.xlsx",
 ]
 OUTPUT_DIR = "etl_output"
 
