@@ -207,19 +207,14 @@ def _parse_ddl_table_name(ddl_file: str) -> tuple:
 
 def build_filter_for_query(
     config: dict,
-    pk_filter_mode: str,
-    pk_range: dict,
-    pk_set: set,
     date_mode: str,
     date_from: str,
     date_from_col: str,
     date_to: str,
     date_to_col: str,
 ) -> dict:
-    """Build WHERE clause filter using PKs from target DDL."""
+    """Build WHERE clause filter for date filtering only."""
     from utils.query_filter import build_where_clause, get_columns_from_ddl
-
-    pk_col = config["primary_keys"][0] if config.get("primary_keys") else None
 
     available_cols = []
     ddl_file = config.get("target_ddl")
@@ -227,10 +222,6 @@ def build_filter_for_query(
         available_cols = get_columns_from_ddl(ddl_file)
 
     where_clause = build_where_clause(
-        pk_filter_mode=pk_filter_mode,
-        pk_col=pk_col,
-        pk_range=pk_range,
-        pk_set=pk_set if pk_filter_mode == "pk_set" else None,
         date_mode=date_mode,
         date_from=date_from if date_mode == "range" else None,
         date_from_col=date_from_col if date_mode == "range" else None,
@@ -239,16 +230,10 @@ def build_filter_for_query(
         available_cols=available_cols,
     )
 
-    parts = []
-    if pk_filter_mode != "full":
-        parts.append(f"PK={pk_filter_mode}")
-    if date_mode != "full":
-        parts.append(f"DATE={date_mode}")
-    description = ", ".join(parts) if parts else "full load (no filters)"
+    description = f"DATE={date_mode}" if date_mode != "full" else "full load (no filters)"
 
     return {
         "where_clause": where_clause,
-        "pk_mode": pk_filter_mode,
         "date_mode": date_mode,
         "description": description,
     }

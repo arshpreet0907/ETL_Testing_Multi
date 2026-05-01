@@ -30,10 +30,7 @@ dbutils.widgets.text("SUB_PATH",            "xl")
 dbutils.widgets.text("STORAGE_ACCOUNT",     "etlstorage0907")
 dbutils.widgets.text("CONTAINER",           "etl-source-data")
 dbutils.widgets.text("VERIFY_SCHEMA",       "true")
-dbutils.widgets.text("PK_FILTER_MODE",      "full")
 dbutils.widgets.text("DATE_WATERMARK_MODE", "full")
-dbutils.widgets.text("PK_RANGE_LOWER",      "")
-dbutils.widgets.text("PK_RANGE_UPPER",      "")
 dbutils.widgets.text("DATE_FROM",           "")
 dbutils.widgets.text("DATE_FROM_COL",       "")
 dbutils.widgets.text("DATE_TO",             "")
@@ -42,6 +39,8 @@ dbutils.widgets.text("PARTIAL_COLS",        "")
 dbutils.widgets.text("RUN_SYNTAX_CHECK",    "true")
 dbutils.widgets.text("EXCEL_FILE",          "analytics_dw.public.dim_vehicle_master.xlsx")
 dbutils.widgets.text("SF_DATABASE",         "ANALYTICS_DW")
+dbutils.widgets.text("CLEAN_OUTPUT",         "true")
+
 
 # ── Repo path + sys.path (needed to import generate_runbook below) ──
 REPO_PATH = os.path.dirname(os.path.abspath(__file__)) if "__file__" in dir() else os.getcwd()
@@ -85,6 +84,8 @@ def _get_param(name: str, params_json: dict, *, required: bool = True,
 # ──────────────────────────────────────────────────────────────────
 EXCEL_FILE       = dbutils.widgets.get("EXCEL_FILE")
 RUN_SYNTAX_CHECK = dbutils.widgets.get("RUN_SYNTAX_CHECK").lower() == "true"
+CLEAN_OUTPUT = dbutils.widgets.get("CLEAN_OUTPUT").lower() == "true"
+
 
 # Derive TABLE_NAME from excel filename (e.g. analytics_dw.public.dim_vehicle_master.xlsx → public_dim_vehicle_master)
 _excel_stem      = os.path.splitext(EXCEL_FILE)[0]           # analytics_dw.public.dim_vehicle_master
@@ -111,6 +112,7 @@ _output_dir = os.path.join(REPO_PATH, "excel_files", "etl_output")
 _log.info(f"Generating runbook from : {EXCEL_FILE}")
 _log.info(f"  Partial cols (widget) : {_partial_for_gen}")
 _log.info(f"  Syntax check          : {RUN_SYNTAX_CHECK}")
+_log.info(f"  Clean output          : {CLEAN_OUTPUT}")
 
 _t_rb = _time.time()
 generate_runbook(
@@ -118,6 +120,7 @@ generate_runbook(
     _output_dir,
     partial_cols=_partial_for_gen,
     run_syntax_check=RUN_SYNTAX_CHECK,
+    clean_output=CLEAN_OUTPUT
 )
 _log.info(f"✅ Runbook generated ({_time.time()-_t_rb:.1f}s)")
 
@@ -143,20 +146,11 @@ SUB_PATH            = _get_param("SUB_PATH",            _PARAMS_JSON)
 STORAGE_ACCOUNT     = _get_param("STORAGE_ACCOUNT",     _PARAMS_JSON)
 CONTAINER           = _get_param("CONTAINER",           _PARAMS_JSON)
 VERIFY_SCHEMA       = _get_param("VERIFY_SCHEMA",       _PARAMS_JSON, default="true").lower() == "true"
-PK_FILTER_MODE      = _get_param("PK_FILTER_MODE",      _PARAMS_JSON, default="full")
 DATE_WATERMARK_MODE = _get_param("DATE_WATERMARK_MODE", _PARAMS_JSON, default="full")
 SF_DATABASE         = _get_param("SF_DATABASE",         _PARAMS_JSON, required=False) or None
 
 _partial_raw        = _get_param("PARTIAL_COLS",        _PARAMS_JSON, required=False)
 PARTIAL_COLS        = [c.strip().upper() for c in _partial_raw.split(",") if c.strip()] or None
-
-_pk_lower           = _get_param("PK_RANGE_LOWER",      _PARAMS_JSON, required=False)
-_pk_upper           = _get_param("PK_RANGE_UPPER",      _PARAMS_JSON, required=False)
-PK_RANGE = {
-    "lower": int(_pk_lower) if _pk_lower else None,
-    "upper": int(_pk_upper) if _pk_upper else None,
-}
-PK_SET = set()
 
 DATE_FROM           = _get_param("DATE_FROM",           _PARAMS_JSON, required=False) or None
 DATE_FROM_COL       = _get_param("DATE_FROM_COL",       _PARAMS_JSON, required=False) or None
@@ -171,7 +165,6 @@ _log.info(f"  SUB_PATH            : {SUB_PATH}")
 _log.info(f"  STORAGE_ACCOUNT     : {STORAGE_ACCOUNT}")
 _log.info(f"  CONTAINER           : {CONTAINER}")
 _log.info(f"  VERIFY_SCHEMA       : {VERIFY_SCHEMA}")
-_log.info(f"  PK_FILTER_MODE      : {PK_FILTER_MODE}")
 _log.info(f"  DATE_WATERMARK_MODE : {DATE_WATERMARK_MODE}")
 _log.info(f"  PARTIAL_COLS        : {PARTIAL_COLS}")
 _log.info(f"  SF_DATABASE         : {SF_DATABASE}")
@@ -232,9 +225,6 @@ _log.info(f"   Servers      : {[s['server_name'] for s in config['servers']]}")
 
 SOURCE_FILTER, TARGET_FILTER = build_load_filters(
     config=config,
-    pk_filter_mode=PK_FILTER_MODE,
-    pk_range=PK_RANGE,
-    pk_set=PK_SET,
     date_mode=DATE_WATERMARK_MODE,
     date_from=DATE_FROM,
     date_from_col=DATE_FROM_COL,

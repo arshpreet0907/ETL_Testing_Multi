@@ -2,40 +2,26 @@
 utils/query_filter.py
 ---------------------
 Builds and injects WHERE clause filters into SQL queries at runtime,
-based on PK filter mode and date watermark mode settings from
-custom_execution.py.
+based on date watermark mode settings from custom_execution.py.
 
-Two independent filter axes — both may apply simultaneously:
-
-    PK Filter
-    ---------
-    PK_FILTER_MODE = "full"      → no PK filter
-    PK_FILTER_MODE = "pk_range"  → WHERE pk >= LOWER  AND/OR pk <= UPPER
-                                   (either bound may be None)
-    PK_FILTER_MODE = "pk_set"    → WHERE pk IN (...)
-
-    Date Watermark
-    --------------
-    DATE_WATERMARK_MODE = "full"  → no date filter
-    DATE_WATERMARK_MODE = "range" → WHERE DATE_FROM_COL >= 'DATE_FROM'
-                                        AND/OR DATE_TO_COL <= 'DATE_TO'
-                                    (either bound / col may be None)
+Date Watermark
+--------------
+DATE_WATERMARK_MODE = "full"  → no date filter
+DATE_WATERMARK_MODE = "range" → WHERE DATE_FROM_COL >= 'DATE_FROM'
+                                    AND/OR DATE_TO_COL <= 'DATE_TO'
+                                (either bound / col may be None)
 
 Public API
 ----------
     from utils.query_filter import build_where_clause, apply_filter_to_sql
 
     where = build_where_clause(
-        pk_filter_mode   = "pk_range",
-        pk_col           = "ledger_id",
-        pk_range         = {"lower": 1, "upper": 500000},
-        pk_set           = None,
         date_mode        = "range",
         date_from        = "2024-01-01",
         date_from_col    = "created_at",
         date_to          = None,
         date_to_col      = None,
-        available_cols   = ["ledger_id", "created_at", "updated_at", ...],
+        available_cols   = ["created_at", "updated_at", ...],
     )
 
     filtered_sql = apply_filter_to_sql(base_sql, where)
@@ -43,24 +29,16 @@ Public API
 
 from __future__ import annotations
 
-from typing import Optional, Set
+from typing import Optional
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
 # Valid mode constants
-_PK_MODES   = {"full", "pk_range", "pk_set"}
 _DATE_MODES = {"full", "range"}
 
 
 # ── Validation helpers ─────────────────────────────────────────────────────
-
-def _validate_pk_mode(mode: str) -> None:
-    if mode not in _PK_MODES:
-        raise ValueError(
-            f"PK_FILTER_MODE must be one of {sorted(_PK_MODES)}, got: {mode!r}"
-        )
-
 
 def _validate_date_mode(mode: str) -> None:
     if mode not in _DATE_MODES:
@@ -83,10 +61,6 @@ def _check_col_exists(col: str, available_cols: list[str], context: str) -> None
 # ── Core builder ───────────────────────────────────────────────────────────
 
 def build_where_clause(
-    pk_filter_mode:   str,
-    pk_col:           Optional[str],
-    pk_range:         Optional[dict],          # {"lower": int|None, "upper": int|None}
-    pk_set:           Optional[Set],
     date_mode:        str,
     date_from:        Optional[str],
     date_from_col:    Optional[str],
@@ -95,22 +69,12 @@ def build_where_clause(
     available_cols:   list[str],
 ) -> str:
     """
-    Build a SQL WHERE clause string (without the 'WHERE' keyword) combining
-    the PK filter and date watermark conditions.
+    Build a SQL WHERE clause string (without the 'WHERE' keyword) for date filtering.
 
-    Returns an empty string if both modes are 'full' or produce no conditions.
+    Returns an empty string if date_mode is 'full' or produces no conditions.
 
     Parameters
     ----------
-    pk_filter_mode : str
-        "full" | "pk_range" | "pk_set"
-    pk_col : str or None
-        Primary key column name. Required for pk_range / pk_set modes.
-    pk_range : dict or None
-        {"lower": value_or_None, "upper": value_or_None}
-        Used when pk_filter_mode == "pk_range".
-    pk_set : set or None
-        Set of PK values. Used when pk_filter_mode == "pk_set".
     date_mode : str
         "full" | "range"
     date_from : str or None
@@ -129,51 +93,9 @@ def build_where_clause(
     str
         WHERE conditions joined by AND, or "" if no conditions apply.
     """
-    _validate_pk_mode(pk_filter_mode)
     _validate_date_mode(date_mode)
 
     conditions: list[str] = []
-
-    # ── PK filter ──────────────────────────────────────────────────────────
-    if pk_filter_mode == "pk_range":
-        if not pk_col:
-            raise ValueError(
-                "PK_FILTER_MODE is 'pk_range' but no PK column could be determined. "
-                "Ensure PRIMARY_KEYS is set."
-            )
-        lower = (pk_range or {}).get("lower")
-        upper = (pk_range or {}).get("upper")
-
-        if lower is None and upper is None:
-            raise ValueError(
-                "PK_FILTER_MODE is 'pk_range' but PK_RANGE has both lower and upper as None. "
-                "Provide at least one bound."
-            )
-
-        if lower is not None and upper is not None:
-            conditions.append(f"{pk_col} >= {lower} AND {pk_col} <= {upper}")
-            logger.info("PK filter: %s BETWEEN %s AND %s", pk_col, lower, upper)
-        elif lower is not None:
-            conditions.append(f"{pk_col} >= {lower}")
-            logger.info("PK filter: %s >= %s (lower bound only)", pk_col, lower)
-        else:
-            conditions.append(f"{pk_col} <= {upper}")
-            logger.info("PK filter: %s <= %s (upper bound only)", pk_col, upper)
-
-    elif pk_filter_mode == "pk_set":
-        if not pk_col:
-            raise ValueError(
-                "PK_FILTER_MODE is 'pk_set' but no PK column could be determined. "
-                "Ensure PRIMARY_KEYS is set."
-            )
-        if not pk_set:
-            raise ValueError(
-                "PK_FILTER_MODE is 'pk_set' but PK_SET is empty or None. "
-                "Provide a non-empty set of PK values."
-            )
-        values_csv = ", ".join(str(v) for v in sorted(pk_set))
-        conditions.append(f"{pk_col} IN ({values_csv})")
-        logger.info("PK filter: %s IN (%d values)", pk_col, len(pk_set))
 
     # ── Date watermark filter ──────────────────────────────────────────────
     if date_mode == "range":

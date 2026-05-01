@@ -265,9 +265,6 @@ def step_5_compare(spark, transformed_df, target_df, ctx: dict) -> int:
 
 def build_load_filters(
     config: dict,
-    pk_filter_mode: str,
-    pk_range: dict,
-    pk_set: Set,
     date_mode: str,
     date_from: Optional[str] = None,
     date_from_col: Optional[str] = None,
@@ -285,14 +282,12 @@ def build_load_filters(
     # (PKs are aliased to target names in transform files)
     source_filter = build_filter_for_query(
         config=config,
-        pk_filter_mode=pk_filter_mode, pk_range=pk_range, pk_set=pk_set,
         date_mode=date_mode, date_from=date_from, date_from_col=date_from_col,
         date_to=date_to, date_to_col=date_to_col,
     )
 
     target_filter = build_filter_for_query(
         config=config,
-        pk_filter_mode=pk_filter_mode, pk_range=pk_range, pk_set=pk_set,
         date_mode=date_mode, date_from=date_from, date_from_col=date_from_col,
         date_to=date_to, date_to_col=date_to_col,
     )

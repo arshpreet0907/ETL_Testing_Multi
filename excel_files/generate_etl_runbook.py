@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -1554,6 +1555,7 @@ def generate_runbook(
     output_dir: str | Path = "etl_output",
     partial_cols: list[str] | None = None,
     run_syntax_check: bool = True,
+    clean_output: bool=True
 ) -> None:
     path = Path(excel_path)
     out_base = Path(output_dir)
@@ -1571,6 +1573,10 @@ def generate_runbook(
     # Output folder = target_table name (sanitized)
     table_folder = parsed.target_table.replace(".", "_")
     table_dir = out_base / table_folder
+    if clean_output and table_dir.exists():
+        shutil.rmtree(table_dir)
+        print("Deleted old runbook: %s", table_dir)
+
     table_dir.mkdir(parents=True, exist_ok=True)
 
     # Shared files
@@ -1646,6 +1652,7 @@ RUN_SYNTAX_CHECK: bool = True
 if __name__ == "__main__":
     out = Path(OUTPUT_DIR)
     out.mkdir(parents=True, exist_ok=True)
+    clean_output=True # this makes sure previous table folder is deleted then new files are made, make it false to stop
 
     for excel_file in EXCEL_FILES:
         p = Path(excel_file)
@@ -1657,6 +1664,7 @@ if __name__ == "__main__":
                 p, out,
                 partial_cols=PARTIAL_TARGET_COLS or None,
                 run_syntax_check=RUN_SYNTAX_CHECK,
+                clean_output=clean_output
             )
         except Exception as e:
             print(f"  ERROR: {p.name}: {e}")
