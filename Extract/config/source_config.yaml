@@ -1,0 +1,53 @@
+# config/source_config.yaml
+# --------------------------
+# Source database connection details — multi-server format.
+# Each key under servers: MUST match the corresponding sheet name in the
+# Excel mapping file exactly (case-sensitive).
+#
+# db_type options:
+#   "mysql"      → MySQL DB  (driver: com.mysql.cj.jdbc.Driver, default port 3306)
+#   "sqlserver"  → SQL Server (driver: com.microsoft.sqlserver.jdbc.SQLServerDriver, default port 1433)
+#                  Requires mssql-jdbc-XX.jar in the jars/ folder.
+#                  Run connect.py to verify SQL Server connectivity before extraction.
+
+# ── SERVER CONNECTIONS ────────────────────────────────────────────────
+# Key = sheet name in the Excel mapping file.
+# Rename the sheet names in your Excel files to "mysql_server" and "ms_server"
+# to match these keys.
+
+servers:
+
+  # ── MySQL (local development database) ──────────────────────────────
+  mysql_server:
+    db_type: mysql
+    host: localhost
+    port: 3306
+    database: etl_output_mysql_xl  # Source schema / database name to connect only
+    schema: None
+    user: root
+    password: root
+    fetchsize: 50000               # Rows fetched per JDBC batch
+
+  # ── SQL Server / SSMS ────────────────────────────────────────────────
+  ms_server:
+    db_type: sqlserver
+    host: localhost                # Use "localhost\SQLEXPRESS" for Express edition
+    port: 1433                     # Ensure TCP/IP is enabled on this port in SQL Server Config Manager
+    database: etl_output_server_xl        # Target database name in SQL Server used to connect only
+    schema: dbo
+    user: etl_user                      # ← fill in: SQL Server login name (SQL auth)
+    password: Yashkijay123                     # ← fill in: SQL Server login password
+    fetchsize: 50000
+    encrypt: false                 # Set true if SSL is configured
+    trustServerCertificate: true   # Required when using self-signed / dev certs
+
+# ── LEGACY FLAT FORMAT (backward compatible) ──────────────────────────
+# If 'servers' key is not present, the pipeline falls back to these
+# top-level keys and treats them as a single implicit server.
+# db_type: mysql
+# host: localhost
+# port: 3306
+# database: etl_output_mysql_xxl
+# user: root
+# password: root
+# fetchsize: 50000

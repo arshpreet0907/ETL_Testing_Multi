@@ -1,0 +1,25 @@
+# config/pipeline_config.yaml
+# ----------------------------
+# Pipeline-wide settings: paths, JVM locations, logging.
+# Used by connections/spark_session.py and utils/logger.py
+
+# ── JVM / Hadoop (Windows) ───────────────────────────────────────────────────
+# Set these to match your local installation.
+# If JAVA_HOME and HADOOP_HOME are already set as system environment variables
+# these entries are ignored (system env takes precedence).
+java_home: "C:/Program Files/Java/jdk-17"   # adjust to your JDK path
+hadoop_home: "D:/soft/hadoop"                # folder containing bin/winutils.exe
+
+# ── Project directories ───────────────────────────────────────────────────────
+# Paths are relative to the project root (where run_pipeline.py lives).
+# Change these only if you restructure the project layout.
+jars_dir: "jars"
+input_dir: "input"
+rulebook_dir: "rulebook"
+generated_dir: "generated"
+output_dir: "output"
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+# Python logging level for all pipeline modules.
+# Options: DEBUG | INFO | WARNING | ERROR
+log_level: INFO

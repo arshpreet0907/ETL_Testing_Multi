@@ -1,0 +1,12 @@
+.idea
+.venv
+*.md
+__pycache__
+*.drawio
+*/output/*/*/*.json
+*/output/*/*/*.csv
+*/output/*/*/*.schema.json
+*/output/*.csv
+*/output/*.json
+*/jars/*
+*/excel_files/etl_output
