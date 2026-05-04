@@ -793,23 +793,38 @@ def _phase2_collected(
 
     # ── Missing in target (from slim_joined cache — instant) ──────────
     if missing_count > 0:
-        missing_rows = slim_joined.filter(
+        missing_pks = slim_joined.filter(
             in_src_expr & ~in_tgt_expr
         ).select(
-            *[F.col(f"{_SRC_PREFIX}{pk}").alias(pk) for pk in pk_cols],
-            F.col("_source_server") if "_source_server" in slim_joined.columns else F.lit(None).alias("_source_server")
+            *[F.col(f"{_SRC_PREFIX}{pk}").alias(pk) for pk in pk_cols]
         ).collect()
-        for row in missing_rows:
-            pk_val = "|".join(
-                str(row[pk]) if row[pk] is not None else "" for pk in pk_cols
-            )
-            row_dict = row.asDict()
-            src_server = row_dict.get("_source_server") or "UNKNOWN"
-            diffs.append((
-                pk_val, src_server, "<ENTIRE_ROW>",
-                "<PRESENT_IN_SOURCE>", "<MISSING_IN_TARGET>",
-                "MISSING_IN_TARGET",
-            ))
+        
+        has_source_server = "_source_server" in source_norm.columns
+        if has_source_server:
+            pk_df = spark.createDataFrame(missing_pks)
+            missing_with_server = source_norm.join(
+                F.broadcast(pk_df), on=pk_cols, how="inner"
+            ).select(*pk_cols, "_source_server").collect()
+            for row in missing_with_server:
+                pk_val = "|".join(
+                    str(row[pk]) if row[pk] is not None else "" for pk in pk_cols
+                )
+                src_server = row["_source_server"] or "UNKNOWN"
+                diffs.append((
+                    pk_val, src_server, "<ENTIRE_ROW>",
+                    "<PRESENT_IN_SOURCE>", "<MISSING_IN_TARGET>",
+                    "MISSING_IN_TARGET",
+                ))
+        else:
+            for row in missing_pks:
+                pk_val = "|".join(
+                    str(row[pk]) if row[pk] is not None else "" for pk in pk_cols
+                )
+                diffs.append((
+                    pk_val, "UNKNOWN", "<ENTIRE_ROW>",
+                    "<PRESENT_IN_SOURCE>", "<MISSING_IN_TARGET>",
+                    "MISSING_IN_TARGET",
+                ))
 
     # ── Extra in target (from slim_joined cache — instant) ────────────
     if extra_count > 0:
