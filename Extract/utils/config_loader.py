@@ -6,7 +6,7 @@ Purpose : Load a YAML configuration file and return its contents as a plain dict
           error handling and never scatter open() calls around the codebase.
 
 Usage   :
-    from utils.config_loader import load_config
+    from Extract.utils.config_loader import load_config
     cfg = load_config("config/source_config.yaml")
     host = cfg["host"]
 """

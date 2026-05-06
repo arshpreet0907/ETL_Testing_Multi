@@ -1,7 +1,7 @@
 """
 utils/auto_config.py
 --------------------
-Databricks version — auto-configuration from excel_files/etl_output/ folder.
+Databricks version — auto-configuration from Execution.excel_files/etl_output/ folder.
 V3 multi-server layout: detects server subdirectories containing 04_transform.py.
 
 Returns a config dict with a 'servers' list — one entry per server.
@@ -225,7 +225,7 @@ def build_filter_for_query(
     date_to_col: str,
 ) -> dict:
     """Build WHERE clause filter for date filtering only."""
-    from utils.query_filter import build_where_clause, get_columns_from_ddl
+    from Execution.utils.query_filter import build_where_clause, get_columns_from_ddl
 
     available_cols = []
     ddl_file = config.get("target_ddl")

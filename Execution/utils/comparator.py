@@ -62,7 +62,7 @@ desired return line in compare_dataframes().
 
 Usage
 -----
-    from utils.comparator import compare_dataframes
+    from Execution.utils.comparator import compare_dataframes
 
     diff_df, source_count, target_count, matched_count, total_diffs = compare_dataframes(
         source_df=source_dataframe,

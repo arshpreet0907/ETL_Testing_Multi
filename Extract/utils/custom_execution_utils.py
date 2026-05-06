@@ -35,13 +35,13 @@ Legacy Context keys
 import os
 from typing import Optional, Set
 
-from utils.auto_config import build_filter_for_query
-from utils.connections.source_connection import get_source_connection
-from utils.csv_writer import save_dataframe_as_csv
-from utils.get_data import get_data
-from utils.logger import get_logger
-from utils.query_filter import apply_filter_to_sql
-from utils.verify_schema import verify_schema_from_ddl, verify_partial_ddls
+from Extract.utils.auto_config import build_filter_for_query
+from Extract.utils.connections.source_connection import get_source_connection
+from Extract.utils.csv_writer import save_dataframe_as_csv
+from Extract.utils.get_data import get_data
+from Extract.utils.logger import get_logger
+from Extract.utils.query_filter import apply_filter_to_sql
+from Extract.utils.verify_schema import verify_schema_from_ddl, verify_partial_ddls
 
 logger = get_logger(__name__)
 

@@ -19,7 +19,7 @@ from typing import Dict, List, Tuple
 
 from pyspark.sql import SparkSession
 
-from utils.logger import get_logger
+from Extract.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
@@ -88,7 +88,7 @@ def verify_partial_ddls(
     bool
         True if all DDLs pass verification, False if any mismatch found
     """
-    from utils.auto_config import parse_source_ddl_table_info
+    from Extract.utils.auto_config import parse_source_ddl_table_info
 
     all_passed = True
 

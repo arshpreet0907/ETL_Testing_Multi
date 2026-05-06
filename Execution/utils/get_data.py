@@ -13,7 +13,7 @@ import time
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql.types import StructType
 
-from utils.logger import get_logger
+from Execution.utils.logger import get_logger
 
 logger = get_logger(__name__)
 

@@ -9,7 +9,7 @@ Supports two folder layouts:
   Legacy (single):    <table>/01_create_source_table.sql  +  03_extract_source.sql
 
 Usage:
-    from utils.auto_config import get_table_config, list_available_tables
+    from Extract.utils.auto_config import get_table_config, list_available_tables
 
     config = get_table_config("public_dim_vehicle_master")
 """
@@ -353,7 +353,7 @@ def build_filter_for_query(
     date_to_col: str,
 ) -> dict:
     """Build WHERE clause filter for date filtering only."""
-    from utils.query_filter import build_where_clause, get_columns_from_ddl
+    from Extract.utils.query_filter import build_where_clause, get_columns_from_ddl
 
     available_cols = []
     ddl_file = config.get("source_ddl") or config.get("target_ddl")

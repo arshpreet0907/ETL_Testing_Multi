@@ -18,8 +18,8 @@ from typing import Optional
 
 from pyspark.sql import DataFrame, SparkSession
 
-from utils.connections.source_connection import get_source_connection
-from utils.logger import get_logger
+from Extract.utils.connections.source_connection import get_source_connection
+from Extract.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
@@ -99,6 +99,7 @@ def _read_single(spark: SparkSession, jdbc_opts: dict, query: str) -> DataFrame:
         spark.read.format("jdbc")
         .options(**jdbc_opts)
         .option("query", query)
+        .option("useCursorFetch", "true")
         .load()
     )
 
@@ -116,6 +117,7 @@ def _read_partitioned(
         spark.read.format("jdbc")
         .options(**jdbc_opts)
         .option("dbtable", dbtable_expr)
+        .option("useCursorFetch", "true")
         .option("partitionColumn", partition_col)
         .option("lowerBound", str(lower_bound))
         .option("upperBound", str(upper_bound))

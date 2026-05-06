@@ -16,7 +16,7 @@ The diff_df passed to `generate_report` must have these columns:
 
 Usage
 -----
-    from utils.reporter import generate_report
+    from Execution.utils.reporter import generate_report
     generate_report(
         diff_df=diff_dataframe,
         source_row_count=10_000,
@@ -33,7 +33,7 @@ import sys
 from pyspark.sql import DataFrame
 import pyspark.sql.functions as F
 
-from utils.csv_writer import save_dataframe_as_csv
+from Execution.utils.csv_writer import save_dataframe_as_csv
 
 logger = logging.getLogger(__name__)
 

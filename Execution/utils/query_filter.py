@@ -13,7 +13,7 @@ DATE_WATERMARK_MODE = "range" → WHERE DATE_FROM_COL >= 'DATE_FROM'
 
 Public API
 ----------
-    from utils.query_filter import build_where_clause, apply_filter_to_sql
+    from Execution.utils.query_filter import build_where_clause, apply_filter_to_sql
 
     where = build_where_clause(
         date_mode        = "range",
@@ -30,7 +30,7 @@ Public API
 from __future__ import annotations
 
 from typing import Optional
-from utils.logger import get_logger
+from Execution.utils.logger import get_logger
 
 logger = get_logger(__name__)
 

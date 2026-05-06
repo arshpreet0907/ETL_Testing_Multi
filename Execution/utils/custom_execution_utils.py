@@ -17,14 +17,14 @@ Steps:
 import os
 from typing import Optional, Set
 
-from utils.auto_config import build_filter_for_query
-from utils.connections.target_connection import get_target_connection
-from utils.compare import compare_and_report
-from utils.get_data import get_data_from_storage, get_data_from_snowflake
-from utils.logger import get_logger
-from utils.perform_transform import perform_transform
-from utils.query_filter import apply_filter_to_sql
-from utils.verify_schema import verify_schema_from_ddl
+from Execution.utils.auto_config import build_filter_for_query
+from Execution.utils.connections.target_connection import get_target_connection
+from Execution.utils.compare import compare_and_report
+from Execution.utils.get_data import get_data_from_storage, get_data_from_snowflake
+from Execution.utils.logger import get_logger
+from Execution.utils.perform_transform import perform_transform
+from Execution.utils.query_filter import apply_filter_to_sql
+from Execution.utils.verify_schema import verify_schema_from_ddl
 
 logger = get_logger(__name__)
 

@@ -9,7 +9,7 @@ Inputs  : df        — PySpark DataFrame to persist
                       "output/orders/source_enriched.csv"
 Outputs : The CSV file written to `file_path` on the local filesystem.
 Usage   :
-    from utils.csv_writer import save_dataframe_as_csv
+    from Extract.utils.csv_writer import save_dataframe_as_csv
     save_dataframe_as_csv(df, "output/orders/source_enriched.csv")
 """
 
@@ -24,69 +24,47 @@ from pyspark.sql import DataFrame
 logger = logging.getLogger(__name__)
 
 
+ROWS_PER_PART = 100_000  # each Spark part file targets ~100K rows
+
+
 def save_dataframe_as_csv(df: DataFrame, file_path: str) -> None:
     """
     Write a PySpark DataFrame to a single CSV file at `file_path`.
 
-    The function uses coalesce(1) to produce exactly one Spark part file,
-    then renames it to the desired path so callers never have to deal with
-    Spark's internal directory structure.
-
-    If the DataFrame is already cached (e.g. from the comparator), the
-    write proceeds directly without creating a second cached copy —
-    avoiding a redundant Spark action.
+    Instead of coalesce(1) (which pulls all data into one partition and
+    doubles memory), Spark writes multiple part files of ~100K rows each.
+    The part files are then concatenated sequentially — one chunk at a time —
+    so peak memory stays bounded to a single part file during the merge step.
 
     Also saves a companion .schema.json file alongside the CSV for type-safe reloading.
-
-    Parameters
-    ----------
-    df : pyspark.sql.DataFrame
-        The DataFrame to persist.  Must not be empty for the rename to succeed,
-        though an empty DataFrame will produce a header-only CSV (valid).
-    file_path : str
-        Absolute or relative destination path, including the filename.
-        Parent directories are created automatically.
-        If the file already exists it is overwritten.
-
-    Raises
-    ------
-    FileNotFoundError
-        If Spark produced no part file in the temporary directory (should not
-        happen under normal conditions).
-    RuntimeError
-        If more than one part file is found (coalesce(1) guarantee violated).
     """
     file_path = os.path.normpath(file_path)
     parent_dir = os.path.dirname(file_path) or "."
     os.makedirs(parent_dir, exist_ok=True)
 
-    # Spark writes to a temp directory next to the final file
     tmp_dir = file_path + "_tmp_spark"
+    col_count = len(df.columns)
 
     logger.info("Writing DataFrame to temporary Spark directory: %s", tmp_dir)
 
-    col_count = len(df.columns)
-    row_count = 0
+    # Count rows to calculate number of partitions needed
+    row_count = df.count()
+    num_parts = max(1, (row_count + ROWS_PER_PART - 1) // ROWS_PER_PART)
+    logger.info("Rows: %d — writing in %d part(s) of ~%d rows each", row_count, num_parts, ROWS_PER_PART)
 
-    # Check if already cached — if so, write directly without a second cache
-    is_cached = df.is_cached
-    if is_cached:
-        # DF is already cached upstream — write straight through
-        df.coalesce(1).write.mode("overwrite").option("header", "true").option("nullValue", "").csv(tmp_dir)
-    else:
-        # Not cached — cache the coalesced DF so the count and write share
-        # a single materialisation
-        df_cached = df.coalesce(1).cache()
-        row_count = df_cached.count()
-        df_cached.write.mode("overwrite").option("header", "true").option("nullValue", "").csv(tmp_dir)
-        df_cached.unpersist()
+    (
+        df.repartition(num_parts)
+        .write.mode("overwrite")
+        .option("header", "true")
+        .option("nullValue", "")
+        .csv(tmp_dir)
+    )
 
-    # Locate the single part file Spark produced
-    part_files = glob.glob(os.path.join(tmp_dir, "part-*.csv"))
-
-    if not part_files:
-        # Spark may have written without extension on some versions
-        part_files = glob.glob(os.path.join(tmp_dir, "part-*"))
+    # Collect and sort part files so output order is deterministic
+    part_files = sorted(
+        glob.glob(os.path.join(tmp_dir, "part-*.csv"))
+        or glob.glob(os.path.join(tmp_dir, "part-*"))
+    )
 
     if not part_files:
         raise FileNotFoundError(
@@ -94,32 +72,23 @@ def save_dataframe_as_csv(df: DataFrame, file_path: str) -> None:
             "Check Spark logs for write errors."
         )
 
-    if len(part_files) > 1:
-        raise RuntimeError(
-            f"Expected exactly 1 part file after coalesce(1), found {len(part_files)}: "
-            f"{part_files}"
-        )
+    # Concatenate part files into one final CSV — sequentially, one chunk at a time
+    # First part already has a header; skip the header line for all subsequent parts
+    total_parts = len(part_files)
+    with open(file_path, "wb") as out:
+        for i, part in enumerate(part_files):
+            with open(part, "rb") as src:
+                if i > 0:
+                    src.readline()  # skip repeated header
+                shutil.copyfileobj(src, out)
+            rows_done = min((i + 1) * ROWS_PER_PART, row_count)
+            # print(f"  [{i + 1}/{total_parts}] merged part {i + 1} — ~{rows_done:,} / {row_count:,} rows written")
 
-    # Move the single part file to the desired destination
-    shutil.move(part_files[0], file_path)
+    logger.info("CSV saved: %s (%d rows, %d columns, %d parts merged)", file_path, row_count, col_count, len(part_files))
 
-    # For pre-cached DFs, derive row count from the written file (header line excluded)
-    if is_cached:
-        # Count lines in the written CSV minus header — avoids a Spark action
-        with open(file_path, "r", encoding="utf-8") as f:
-            row_count = sum(1 for _ in f) - 1  # subtract header
-            row_count = max(row_count, 0)
-
-    logger.info("CSV saved: %s (%d rows, %d columns)", file_path, row_count, col_count)
-
-    # Save DataFrame schema alongside CSV for type-safe reloading.
-    # When CSVs are later loaded via load_csvs(), this JSON file is used
-    # to apply the original schema so numeric/date types are preserved
-    # and the comparator's normalisation works correctly.
     schema_path = os.path.splitext(file_path)[0] + ".schema.json"
     with open(schema_path, "w", encoding="utf-8") as sf:
         sf.write(json.dumps(json.loads(df.schema.json()), indent=2))
     logger.info("Schema saved: %s", schema_path)
 
-    # Clean up the temporary Spark directory (_SUCCESS, .crc files, etc.)
     shutil.rmtree(tmp_dir, ignore_errors=True)

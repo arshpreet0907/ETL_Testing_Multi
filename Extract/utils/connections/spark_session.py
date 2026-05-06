@@ -20,7 +20,7 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# Path to the project root — go up 3 levels from utils/connections/spark_session.py
+# Path to the project root — go up 3 levels from Extract.utils/connections/spark_session.py
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
@@ -69,7 +69,8 @@ def get_spark_session(app_name: str = "ETLValidator"):
         # source/target DataFrames comfortably exceed 2 GB of driver heap.
         # 4 GB keeps the GC overhead low and avoids spill-to-disk during joins.
         # If your machine has < 8 GB RAM available, drop to 3g.
-        .config("spark.driver.memory", "4g")
+        .config("spark.driver.memory", "6g")
+        .config("spark.executor.memory", "4g")
         .config("spark.sql.shuffle.partitions", "4")  # low for single-machine ETL
         .config("spark.sql.legacy.timeParserPolicy", "LEGACY")
 
@@ -125,7 +126,7 @@ def _set_env_from_config() -> None:
     This must happen BEFORE PySpark is imported so the JVM picks up the values.
     """
     try:
-        from utils.config_loader import load_config
+        from Extract.utils.config_loader import load_config
         config_path = os.path.join(_PROJECT_ROOT, "config", "pipeline_config.yaml")
         cfg = load_config(config_path)
     except FileNotFoundError:

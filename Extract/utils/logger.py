@@ -7,7 +7,7 @@ Purpose : Provide a single, consistently configured logger factory for all
           having to manage its own handler setup.
 
 Usage   :
-    from utils.logger import get_logger
+    from Extract.utils.logger import get_logger
     logger = get_logger(__name__)
     logger.info("Starting extraction for table: %s", table_name)
 """

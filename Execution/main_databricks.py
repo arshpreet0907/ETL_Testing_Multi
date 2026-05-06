@@ -3,7 +3,7 @@
 # MAGIC # ETL Validation Pipeline — V3 Multi-Server
 # MAGIC
 # MAGIC **Execution**: Databricks Job with dedicated clusters
-# MAGIC - **Source**: Per-server CSVs + schema JSON from Azure Blob Storage (`wasbs://`)
+# MAGIC - **SouRrce**: Per-server CSVs + schema JSON from Azure Blob Storage (`wasbs://`)
 # MAGIC - **Target**: Snowflake via native Spark-Snowflake connector
 # MAGIC - **Output**: `diff_report.csv` written back to Azure Blob Storage
 # MAGIC - **Secrets**: Azure Key Vault via Databricks secret scope `etl-secrets`
@@ -104,7 +104,7 @@ _log.info(f"TABLE_NAME   : {TABLE_NAME}  (bootstrap widget)")
 # ──────────────────────────────────────────────────────────────────
 # Step B — Generate runbook + write parameters.json
 # ──────────────────────────────────────────────────────────────────
-from excel_files.generate_etl_runbook import generate_runbook
+from Execution.excel_files.generate_etl_runbook import generate_runbook
 
 _excel_path = os.path.join(REPO_PATH, "excel_files", EXCEL_FILE)
 _output_dir = os.path.join(REPO_PATH, "excel_files", "etl_output")
@@ -210,9 +210,9 @@ _log.info("✅ Spark config set")
 # CELL 4: BUILD PIPELINE CONTEXT
 # ═══════════════════════════════════════════════════════════════
 
-from utils.auto_config import get_table_config
-from utils.logger import get_logger
-from utils.custom_execution_utils import build_load_filters
+from Execution.utils.auto_config import get_table_config
+from Execution.utils.logger import get_logger
+from Execution.utils.custom_execution_utils import build_load_filters
 
 logger = get_logger("etl_pipeline")
 
@@ -257,7 +257,7 @@ pipeline_ctx = dict(
 # CELL 5: STEP 1 — LOAD SOURCE CSVs (per server)
 # ═══════════════════════════════════════════════════════════════
 
-from utils.custom_execution_utils import step_1_load_source
+from Execution.utils.custom_execution_utils import step_1_load_source
 
 _t0 = _time.time()
 server_dfs = step_1_load_source(spark, pipeline_ctx, BLOB_TABLE_BASE)
@@ -271,7 +271,7 @@ for entry in server_dfs:
 # CELL 6: STEP 2 — TRANSFORM + UNION (per server)
 # ═══════════════════════════════════════════════════════════════
 
-from utils.custom_execution_utils import step_2_transform_union
+from Execution.utils.custom_execution_utils import step_2_transform_union
 
 _t0 = _time.time()
 transformed_df, _row_count = step_2_transform_union(spark, server_dfs, pipeline_ctx)
@@ -285,7 +285,7 @@ display(transformed_df.limit(5))
 # CELL 7: STEP 3 — VERIFY TARGET SCHEMA (Snowflake live)
 # ═══════════════════════════════════════════════════════════════
 
-from utils.custom_execution_utils import step_3_verify_target_schema
+from Execution.utils.custom_execution_utils import step_3_verify_target_schema
 
 _t0 = _time.time()
 passed = step_3_verify_target_schema(spark, pipeline_ctx)
@@ -300,7 +300,7 @@ else:
 # CELL 8: STEP 4 — EXTRACT TARGET FROM SNOWFLAKE
 # ═══════════════════════════════════════════════════════════════
 
-from utils.custom_execution_utils import step_4_extract_target
+from Execution.utils.custom_execution_utils import step_4_extract_target
 
 _t0 = _time.time()
 target_df, _tgt_row_count = step_4_extract_target(spark, pipeline_ctx)
@@ -313,7 +313,7 @@ display(target_df.limit(5))
 # CELL 9: STEP 5 — COMPARE & GENERATE DIFF REPORT
 # ═══════════════════════════════════════════════════════════════
 
-from utils.custom_execution_utils import step_5_compare
+from Execution.utils.custom_execution_utils import step_5_compare
 
 _t0 = _time.time()
 exit_code = step_5_compare(spark, transformed_df, target_df, pipeline_ctx)

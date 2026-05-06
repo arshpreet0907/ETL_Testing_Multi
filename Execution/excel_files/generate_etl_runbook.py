@@ -281,7 +281,7 @@ def parse_excel_via_parser(
     Parse an Excel file using excel_schema_parser and return
     (ParsedExcel for generators, parameters dict).
     """
-    from excel_files.excel_schema_parser import parse_excel as _parser_parse_excel
+    from Execution.excel_files.excel_schema_parser import parse_excel as _parser_parse_excel
 
     parsed_dict = _parser_parse_excel(excel_path, run_syntax_check=run_syntax_check)
     parsed = _adapt_parsed_result(parsed_dict)

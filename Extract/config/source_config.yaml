@@ -22,7 +22,7 @@ servers:
     db_type: mysql
     host: localhost
     port: 3306
-    database: etl_output_mysql_xl  # Source schema / database name to connect only
+    database: etl_output_mysql_xxxl  # Source schema / database name to connect only
     schema: None
     user: root
     password: root
@@ -33,7 +33,7 @@ servers:
     db_type: sqlserver
     host: localhost                # Use "localhost\SQLEXPRESS" for Express edition
     port: 1433                     # Ensure TCP/IP is enabled on this port in SQL Server Config Manager
-    database: etl_output_server_xl        # Target database name in SQL Server used to connect only
+    database: etl_output_server_xxxl_p        # Target database name in SQL Server used to connect only
     schema: dbo
     user: etl_user                      # ← fill in: SQL Server login name (SQL auth)
     password: Yashkijay123                     # ← fill in: SQL Server login password

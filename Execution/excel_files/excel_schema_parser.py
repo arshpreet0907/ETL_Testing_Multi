@@ -724,7 +724,7 @@ def parse_excel(
 
     # ── Run syntax verification ──
     if run_syntax_check:
-        from excel_files.verify_excel_syntax import verify as verify_syntax
+        from Execution.excel_files.verify_excel_syntax import verify as verify_syntax
         print(f"  Verifying syntax: {fname}")
         vresult = verify_syntax(str(path))
         if not vresult.passed:

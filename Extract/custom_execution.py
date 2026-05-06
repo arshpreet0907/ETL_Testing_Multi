@@ -30,10 +30,10 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Literal, Optional, Set
 
-from utils.connections.spark_session import get_spark_session
-from utils.auto_config import get_table_config, list_available_tables
-from utils.logger import get_logger
-from utils.custom_execution_utils import (
+from Extract.utils.connections.spark_session import get_spark_session
+from Extract.utils.auto_config import get_table_config, list_available_tables
+from Extract.utils.logger import get_logger
+from Extract.utils.custom_execution_utils import (
     step_0_verify_partial_schemas,
     step_1_extract_source_v3,
     step_1_5_save_raw_source_csv_v3,
@@ -47,9 +47,9 @@ logger = get_logger(__name__)
 # SECTION 1 — TABLE CONFIGURATION (only TABLE_NAME is required)
 # ============================================================================
 
-TABLE_NAME = "public_dim_vehicle_master"
+# TABLE_NAME = "public_dim_vehicle_master"
 # TABLE_NAME = "public_fact_commercial"
-# TABLE_NAME = "public_fact_production"
+TABLE_NAME = "public_fact_production"
 # PARTIAL_TARGET_COLS =['MODEL_NAME','PRIMARY_PART_NO','SUPPLIER_NAME','PLANT_CONTACT_NAME']#["id", "name"]
 PARTIAL_TARGET_COLS =None#["id", "name"]
 CLEAN_OUTPUT = True  # this makes sure previous table folder is deleted then new files are made, make it false to stop

@@ -11,9 +11,9 @@ import time
 
 from pyspark.sql import SparkSession, DataFrame
 
-from utils.logger import get_logger
-from utils.comparator import compare_dataframes
-from utils.reporter import generate_report
+from Execution.utils.logger import get_logger
+from Execution.utils.comparator import compare_dataframes
+from Execution.utils.reporter import generate_report
 
 logger = get_logger(__name__)
 

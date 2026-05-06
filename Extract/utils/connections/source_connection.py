@@ -36,7 +36,7 @@ source_config.yaml (multi-server format):
 
 import logging
 
-from utils.config_loader import load_config
+from Extract.utils.config_loader import load_config
 
 logger = logging.getLogger(__name__)
 
